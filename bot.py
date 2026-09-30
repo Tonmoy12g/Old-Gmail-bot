@@ -16,7 +16,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("bot")
 
 # ---------- CONFIG ----------
-BOT_TOKEN = os.getenv("8913407701:AAERppuGL2DGi0CKJri7NOjjCgAhlgHKEBU", "")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8913407701:AAERppuGL2DGi0CKJri7NOjjCgAhlgHKEBU")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "gmailsells_bot")
 PORT = int(os.getenv("PORT", "8080"))
 DB_FILE = os.getenv("DB_FILE", "bot.db")
