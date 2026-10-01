@@ -1,8 +1,8 @@
-# main.py — Gmail Sell Bot (SQLite + Render)
-# পার্ট ১/৫ : Imports + Config + Database
+# main.py — Gmail Sell Bot (Polling + SQLite + Render)
+# পার্ট ১/৫ : Config + Database
 
 import asyncio, json, logging, os, re, sqlite3
-from datetime import datetime, date
+from datetime import datetime
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -15,7 +15,9 @@ from aiohttp import web
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("bot")
 
-# ---------- CONFIG ----------
+# ==========================================================
+# CONFIG
+# ==========================================================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8913407701:AAERppuGL2DGi0CKJri7NOjjCgAhlgHKEBU")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "gmailsells_bot")
 PORT = int(os.getenv("PORT", "8080"))
@@ -23,12 +25,18 @@ DB_FILE = os.getenv("DB_FILE", "bot.db")
 ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "8094164308").split(",") if x.strip().isdigit()]
 
 DEFAULT_SETTINGS = {
-    "gmail_rate": "16", "refer_percent": "10",
-    "min_wd_gmail": "20", "min_wd_refer": "50",
-    "refer_charge": "10", "min_refers": "10",
-    "warning_limit": "3", "support": "TrustVaultMails_Owner",
-    "channel": "TrustVaultMailsOfficial", "recovery": "",
-    "maintenance": "0", "welcome": "🎉 বটে স্বাগতম!",
+    "refer_percent": "10",
+    "min_wd_gmail": "20",
+    "min_wd_refer": "50",
+    "refer_charge": "10",
+    "min_refers": "10",
+    "warning_limit": "3",
+    "support": "TrustVaultMails_Owner",
+    "channel": "TrustVaultMailsOfficial",
+    "recovery_email": "",
+    "master_password": "",
+    "maintenance": "0",
+    "welcome": "🎉 বটে স্বাগতম!",
     "method_charges": "{}",
 }
 
@@ -49,39 +57,98 @@ class DB:
     def _migrate(self):
         self.conn.executescript("""
         CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT,
-            gmail_wallet REAL DEFAULT 0, refer_wallet REAL DEFAULT 0,
-            referred_by INTEGER, total_refers INTEGER DEFAULT 0,
-            refer_income REAL DEFAULT 0, fake_warnings INTEGER DEFAULT 0,
-            banned INTEGER DEFAULT 0, is_new INTEGER DEFAULT 1, created_at TEXT);
-        CREATE TABLE IF NOT EXISTS states (user_id INTEGER PRIMARY KEY, state TEXT);
+            user_id INTEGER PRIMARY KEY,
+            username TEXT, first_name TEXT,
+            gmail_wallet REAL DEFAULT 0,
+            refer_wallet REAL DEFAULT 0,
+            referred_by INTEGER,
+            total_refers INTEGER DEFAULT 0,
+            refer_income REAL DEFAULT 0,
+            fake_warnings INTEGER DEFAULT 0,
+            banned INTEGER DEFAULT 0,
+            is_new INTEGER DEFAULT 1,
+            created_at TEXT);
+
+        CREATE TABLE IF NOT EXISTS states (
+            user_id INTEGER PRIMARY KEY,
+            state TEXT);
+
+        CREATE TABLE IF NOT EXISTS categories (
+            key TEXT PRIMARY KEY,
+            label TEXT,
+            rate INTEGER DEFAULT 0,
+            created_at TEXT);
+
         CREATE TABLE IF NOT EXISTS stock (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, gmail TEXT UNIQUE,
-            password TEXT, added_at TEXT);
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            gmail TEXT UNIQUE,
+            password TEXT,
+            category TEXT,
+            added_at TEXT);
+
         CREATE TABLE IF NOT EXISTS tasks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER,
-            gmail TEXT, password TEXT, recovery TEXT, status TEXT,
-            admin_msgs TEXT, created_at TEXT);
-        CREATE TABLE IF NOT EXISTS used (gmail TEXT PRIMARY KEY, used_at TEXT);
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            gmail TEXT,
+            password TEXT,
+            recovery TEXT,
+            category TEXT,
+            status TEXT,
+            admin_msgs TEXT,
+            created_at TEXT);
+
+        CREATE TABLE IF NOT EXISTS used (
+            gmail TEXT PRIMARY KEY,
+            used_at TEXT);
+
         CREATE TABLE IF NOT EXISTS history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, task_id INTEGER,
-            user_id INTEGER, username TEXT, gmail TEXT, password TEXT,
-            status TEXT, amount REAL, admin TEXT, timestamp TEXT);
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id INTEGER,
+            user_id INTEGER,
+            username TEXT,
+            gmail TEXT,
+            password TEXT,
+            category TEXT,
+            status TEXT,
+            amount REAL,
+            admin TEXT,
+            timestamp TEXT);
+
         CREATE TABLE IF NOT EXISTS withdrawals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount REAL,
-            method TEXT, wallet TEXT, status TEXT, admin TEXT, timestamp TEXT);
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            amount REAL,
+            method TEXT,
+            wallet TEXT,
+            status TEXT,
+            admin TEXT,
+            timestamp TEXT);
+
         CREATE TABLE IF NOT EXISTS active_wd (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount REAL,
-            gross REAL, charge REAL, method TEXT, wallet TEXT,
-            admin_msgs TEXT, created_at TEXT);
-        CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
-        CREATE TABLE IF NOT EXISTS extra_admins (user_id INTEGER PRIMARY KEY);
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            amount REAL,
+            gross REAL,
+            charge REAL,
+            method TEXT,
+            wallet TEXT,
+            admin_msgs TEXT,
+            created_at TEXT);
+
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT);
+
+        CREATE TABLE IF NOT EXISTS extra_admins (
+            user_id INTEGER PRIMARY KEY);
         """)
         self.conn.commit()
 
     def _seed(self):
         for k, v in DEFAULT_SETTINGS.items():
-            self.conn.execute("INSERT OR IGNORE INTO settings (key,value) VALUES (?,?)", (k, v))
+            self.conn.execute(
+                "INSERT OR IGNORE INTO settings (key,value) VALUES (?,?)",
+                (k, v))
         self.conn.commit()
 
     # ---------- settings ----------
@@ -90,31 +157,33 @@ class DB:
         return r["value"] if r else default
 
     def set(self, key, value):
-        self.conn.execute("INSERT INTO settings (key,value) VALUES (?,?) "
-                          "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                          (key, str(value)))
+        self.conn.execute(
+            "INSERT INTO settings (key,value) VALUES (?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, str(value)))
         self.conn.commit()
 
     def geti(self, key, default=0):
-        try: return int(float(self.get(key, str(default))))
-        except: return default
-
-    def getf(self, key, default=0.0):
-        try: return float(self.get(key, str(default)))
-        except: return default
+        try:
+            return int(float(self.get(key, str(default))))
+        except Exception:
+            return default
 
     # ---------- users ----------
     def user(self, uid):
         return self.conn.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
 
     def create_user(self, uid, uname, fname):
-        self.conn.execute("INSERT OR IGNORE INTO users (user_id,username,first_name,created_at) "
-                          "VALUES (?,?,?,?)", (uid, uname, fname, datetime.now().isoformat()))
+        self.conn.execute(
+            "INSERT OR IGNORE INTO users (user_id,username,first_name,created_at) "
+            "VALUES (?,?,?,?)",
+            (uid, uname, fname, datetime.now().isoformat()))
         self.conn.commit()
 
     def upd_profile(self, uid, uname, fname):
-        self.conn.execute("UPDATE users SET username=?, first_name=? WHERE user_id=?",
-                          (uname, fname, uid))
+        self.conn.execute(
+            "UPDATE users SET username=?, first_name=? WHERE user_id=?",
+            (uname, fname, uid))
         self.conn.commit()
 
     def is_banned(self, uid):
@@ -122,14 +191,16 @@ class DB:
         return bool(r and r["banned"])
 
     def ban(self, uid, b):
-        self.conn.execute("UPDATE users SET banned=? WHERE user_id=?",
-                          (1 if b else 0, uid))
+        self.conn.execute(
+            "UPDATE users SET banned=? WHERE user_id=?",
+            (1 if b else 0, uid))
         self.conn.commit()
 
     def is_admin(self, uid):
-        if uid in ADMIN_IDS: return True
-        return self.conn.execute("SELECT 1 FROM extra_admins WHERE user_id=?",
-                                 (uid,)).fetchone() is not None
+        if uid in ADMIN_IDS:
+            return True
+        return self.conn.execute(
+            "SELECT 1 FROM extra_admins WHERE user_id=?", (uid,)).fetchone() is not None
 
     def admins(self):
         ids = set(ADMIN_IDS)
@@ -155,16 +226,41 @@ class DB:
         return r["state"] if r else ""
 
     def set_state(self, uid, s):
-        self.conn.execute("INSERT INTO states (user_id,state) VALUES (?,?) "
-                          "ON CONFLICT(user_id) DO UPDATE SET state=excluded.state",
-                          (uid, s))
+        self.conn.execute(
+            "INSERT INTO states (user_id,state) VALUES (?,?) "
+            "ON CONFLICT(user_id) DO UPDATE SET state=excluded.state",
+            (uid, s))
+        self.conn.commit()
+
+    # ---------- categories ----------
+    def cats(self):
+        return [dict(r) for r in self.conn.execute(
+            "SELECT * FROM categories ORDER BY created_at").fetchall()]
+
+    def cat(self, key):
+        return self.conn.execute("SELECT * FROM categories WHERE key=?", (key,)).fetchone()
+
+    def add_cat(self, key, label, rate):
+        self.conn.execute(
+            "INSERT OR REPLACE INTO categories (key,label,rate,created_at) "
+            "VALUES (?,?,?,?)",
+            (key, label, rate, datetime.now().isoformat()))
+        self.conn.commit()
+
+    def del_cat(self, key):
+        self.conn.execute("DELETE FROM categories WHERE key=?", (key,))
+        self.conn.commit()
+
+    def set_cat_rate(self, key, rate):
+        self.conn.execute("UPDATE categories SET rate=? WHERE key=?", (rate, key))
         self.conn.commit()
 
     # ---------- stock ----------
-    def add_stock(self, gmail, pwd):
+    def add_stock(self, gmail, pwd, cat="old"):
         try:
-            self.conn.execute("INSERT INTO stock (gmail,password,added_at) VALUES (?,?,?)",
-                              (gmail, pwd, datetime.now().isoformat()))
+            self.conn.execute(
+                "INSERT INTO stock (gmail,password,category,added_at) VALUES (?,?,?,?)",
+                (gmail, pwd, cat, datetime.now().isoformat()))
             self.conn.commit()
             return True
         except sqlite3.IntegrityError:
@@ -178,8 +274,9 @@ class DB:
                 self.conn.execute("SELECT * FROM stock LIMIT ?", (limit,)).fetchall()]
 
     def del_stock(self, gmail):
-        c = self.conn.execute("DELETE FROM stock WHERE LOWER(gmail)=?",
-                              (gmail.lower().strip(),))
+        c = self.conn.execute(
+            "DELETE FROM stock WHERE LOWER(gmail)=?",
+            (gmail.lower().strip(),))
         self.conn.commit()
         return c.rowcount
 
@@ -189,7 +286,7 @@ class DB:
         self.conn.commit()
         return c
 
-    # ---------- used / duplicate ----------
+    # ---------- duplicate check ----------
     def used(self, gmail):
         g = gmail.lower().strip()
         if self.conn.execute("SELECT 1 FROM used WHERE gmail=?", (g,)).fetchone():
@@ -199,15 +296,17 @@ class DB:
         return False
 
     def mark_used(self, gmail):
-        self.conn.execute("INSERT OR IGNORE INTO used (gmail,used_at) VALUES (?,?)",
-                          (gmail.lower().strip(), datetime.now().isoformat()))
+        self.conn.execute(
+            "INSERT OR IGNORE INTO used (gmail,used_at) VALUES (?,?)",
+            (gmail.lower().strip(), datetime.now().isoformat()))
         self.conn.commit()
 
     # ---------- tasks ----------
-    def new_task(self, uid, gmail, pwd, rec):
-        c = self.conn.execute("INSERT INTO tasks (user_id,gmail,password,recovery,status,created_at) "
-                              "VALUES (?,?,?,?,'submitted',?)",
-                              (uid, gmail, pwd, rec, datetime.now().isoformat()))
+    def new_task(self, uid, gmail, pwd, rec, cat):
+        c = self.conn.execute(
+            "INSERT INTO tasks (user_id,gmail,password,recovery,category,status,created_at) "
+            "VALUES (?,?,?,?,?,'submitted',?)",
+            (uid, gmail, pwd, rec, cat, datetime.now().isoformat()))
         self.conn.commit()
         return c.lastrowid
 
@@ -215,8 +314,9 @@ class DB:
         return self.conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
 
     def task_msgs(self, tid, msgs):
-        self.conn.execute("UPDATE tasks SET admin_msgs=? WHERE id=?",
-                          (json.dumps(msgs), tid))
+        self.conn.execute(
+            "UPDATE tasks SET admin_msgs=? WHERE id=?",
+            (json.dumps(msgs), tid))
         self.conn.commit()
 
     def del_task(self, tid):
@@ -224,11 +324,12 @@ class DB:
         self.conn.commit()
 
     # ---------- history ----------
-    def add_history(self, tid, uid, uname, gmail, pwd, status, amount, admin):
-        self.conn.execute("INSERT INTO history (task_id,user_id,username,gmail,password,"
-                          "status,amount,admin,timestamp) VALUES (?,?,?,?,?,?,?,?,?)",
-                          (tid, uid, uname, gmail, pwd, status, amount, admin,
-                           datetime.now().isoformat()))
+    def add_history(self, tid, uid, uname, gmail, pwd, cat, status, amount, admin):
+        self.conn.execute(
+            "INSERT INTO history (task_id,user_id,username,gmail,password,category,"
+            "status,amount,admin,timestamp) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (tid, uid, uname, gmail, pwd, cat, status, amount, admin,
+             datetime.now().isoformat()))
         self.conn.commit()
 
     def history(self, limit=200):
@@ -238,32 +339,41 @@ class DB:
 
     def user_history(self, uid, limit=30):
         return [dict(r) for r in
-                self.conn.execute("SELECT * FROM history WHERE user_id=? "
-                                  "ORDER BY id DESC LIMIT ?", (uid, limit)).fetchall()]
+                self.conn.execute(
+                    "SELECT * FROM history WHERE user_id=? ORDER BY id DESC LIMIT ?",
+                    (uid, limit)).fetchall()]
 
     # ---------- wallets ----------
     def add_wallet(self, uid, field, amt):
-        if field not in ("gmail_wallet", "refer_wallet"): return
-        self.conn.execute(f"UPDATE users SET {field}={field}+? WHERE user_id=?",
-                          (amt, uid))
+        if field not in ("gmail_wallet", "refer_wallet"):
+            return
+        self.conn.execute(
+            f"UPDATE users SET {field}={field}+? WHERE user_id=?",
+            (amt, uid))
         self.conn.commit()
 
     def set_wallet(self, uid, field, val):
-        if field not in ("gmail_wallet", "refer_wallet"): return
-        self.conn.execute(f"UPDATE users SET {field}=? WHERE user_id=?", (val, uid))
+        if field not in ("gmail_wallet", "refer_wallet"):
+            return
+        self.conn.execute(
+            f"UPDATE users SET {field}=? WHERE user_id=?",
+            (val, uid))
         self.conn.commit()
 
     def add_refer_income(self, uid, amt):
-        self.conn.execute("UPDATE users SET refer_wallet=refer_wallet+?, "
-                          "refer_income=refer_income+? WHERE user_id=?",
-                          (amt, amt, uid))
+        self.conn.execute(
+            "UPDATE users SET refer_wallet=refer_wallet+?, "
+            "refer_income=refer_income+? WHERE user_id=?",
+            (amt, amt, uid))
         self.conn.commit()
 
     def add_referral(self, ref_id, new_uid):
-        self.conn.execute("UPDATE users SET total_refers=total_refers+1 WHERE user_id=?",
-                          (ref_id,))
-        self.conn.execute("UPDATE users SET referred_by=?, is_new=0 WHERE user_id=?",
-                          (ref_id, new_uid))
+        self.conn.execute(
+            "UPDATE users SET total_refers=total_refers+1 WHERE user_id=?",
+            (ref_id,))
+        self.conn.execute(
+            "UPDATE users SET referred_by=?, is_new=0 WHERE user_id=?",
+            (ref_id, new_uid))
         self.conn.commit()
 
     def set_not_new(self, uid):
@@ -271,19 +381,20 @@ class DB:
         self.conn.commit()
 
     def inc_warning(self, uid):
-        self.conn.execute("UPDATE users SET fake_warnings=fake_warnings+1 WHERE user_id=?",
-                          (uid,))
+        self.conn.execute(
+            "UPDATE users SET fake_warnings=fake_warnings+1 WHERE user_id=?",
+            (uid,))
         self.conn.commit()
-        r = self.conn.execute("SELECT fake_warnings FROM users WHERE user_id=?",
-                              (uid,)).fetchone()
+        r = self.conn.execute(
+            "SELECT fake_warnings FROM users WHERE user_id=?", (uid,)).fetchone()
         return r["fake_warnings"] if r else 0
 
     # ---------- withdrawals ----------
     def new_wd(self, uid, amt, gross, chg, method, wallet):
-        c = self.conn.execute("INSERT INTO active_wd (user_id,amount,gross,charge,"
-                              "method,wallet,created_at) VALUES (?,?,?,?,?,?,?)",
-                              (uid, amt, gross, chg, method, wallet,
-                               datetime.now().isoformat()))
+        c = self.conn.execute(
+            "INSERT INTO active_wd (user_id,amount,gross,charge,method,wallet,created_at) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (uid, amt, gross, chg, method, wallet, datetime.now().isoformat()))
         self.conn.commit()
         return c.lastrowid
 
@@ -291,8 +402,9 @@ class DB:
         return self.conn.execute("SELECT * FROM active_wd WHERE id=?", (wid,)).fetchone()
 
     def wd_msgs(self, wid, msgs):
-        self.conn.execute("UPDATE active_wd SET admin_msgs=? WHERE id=?",
-                          (json.dumps(msgs), wid))
+        self.conn.execute(
+            "UPDATE active_wd SET admin_msgs=? WHERE id=?",
+            (json.dumps(msgs), wid))
         self.conn.commit()
 
     def del_wd(self, wid):
@@ -300,16 +412,17 @@ class DB:
         self.conn.commit()
 
     def add_wd_history(self, uid, uname, amt, method, wallet, status, admin):
-        self.conn.execute("INSERT INTO withdrawals (user_id,amount,method,wallet,"
-                          "status,admin,timestamp) VALUES (?,?,?,?,?,?,?)",
-                          (uid, amt, method, wallet, status, admin,
-                           datetime.now().isoformat()))
+        self.conn.execute(
+            "INSERT INTO withdrawals (user_id,amount,method,wallet,status,admin,timestamp) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (uid, amt, method, wallet, status, admin, datetime.now().isoformat()))
         self.conn.commit()
 
     def wd_history(self, limit=200):
         return [dict(r) for r in
-                self.conn.execute("SELECT * FROM withdrawals ORDER BY id DESC LIMIT ?",
-                                  (limit,)).fetchall()]
+                self.conn.execute(
+                    "SELECT * FROM withdrawals ORDER BY id DESC LIMIT ?",
+                    (limit,)).fetchall()]
 
     # ---------- misc ----------
     def total_users(self):
@@ -320,16 +433,23 @@ class DB:
                 self.conn.execute("SELECT user_id FROM users").fetchall()]
 
     def find_uname(self, uname):
-        r = self.conn.execute("SELECT user_id FROM users WHERE LOWER(username)=LOWER(?)",
-                              (uname.lstrip("@").strip(),)).fetchone()
+        r = self.conn.execute(
+            "SELECT user_id FROM users WHERE LOWER(username)=LOWER(?)",
+            (uname.lstrip("@").strip(),)).fetchone()
         return r["user_id"] if r else None
 
     def top_refs(self, limit=20):
         return [dict(r) for r in
-                self.conn.execute("SELECT user_id,username,first_name,total_refers,"
-                                  "refer_income FROM users WHERE total_refers>0 "
-                                  "ORDER BY total_refers DESC LIMIT ?",
-                                  (limit,)).fetchall()]
+                self.conn.execute(
+                    "SELECT user_id,username,first_name,total_refers,refer_income "
+                    "FROM users WHERE total_refers>0 "
+                    "ORDER BY total_refers DESC LIMIT ?",
+                    (limit,)).fetchall()]
+
+    def zero_all_wallets(self):
+        self.conn.execute("UPDATE users SET gmail_wallet=0, refer_wallet=0")
+        self.conn.commit()
+
 
 db = DB(DB_FILE)
 # ==========================================================
@@ -363,52 +483,18 @@ def udisplay(uid, row=None):
     return f"ID: {uid}"
 
 
-def refer_pct():
-    return db.geti("refer_percent", 10)
-
-
-def gmail_rate():
-    return db.geti("gmail_rate", 16)
-
-
-def min_wd_g():
-    return db.geti("min_wd_gmail", 20)
-
-
-def min_wd_r():
-    return db.geti("min_wd_refer", 50)
-
-
-def ref_charge():
-    return db.geti("refer_charge", 10)
-
-
-def min_refs():
-    return db.geti("min_refers", 10)
-
-
-def warn_limit():
-    return db.geti("warning_limit", 3)
-
-
-def support_u():
-    return db.get("support", "TrustVaultMails_Owner")
-
-
-def channel_u():
-    return db.get("channel", "TrustVaultMailsOfficial")
-
-
-def recovery():
-    return db.get("recovery", "")
-
-
-def maintenance():
-    return db.get("maintenance", "0") == "1"
-
-
-def welcome():
-    return db.get("welcome", "🎉 বটে স্বাগতম!")
+def refer_pct(): return db.geti("refer_percent", 10)
+def min_wd_g(): return db.geti("min_wd_gmail", 20)
+def min_wd_r(): return db.geti("min_wd_refer", 50)
+def ref_charge(): return db.geti("refer_charge", 10)
+def min_refs(): return db.geti("min_refers", 10)
+def warn_limit(): return db.geti("warning_limit", 3)
+def support_u(): return db.get("support", "TrustVaultMails_Owner")
+def channel_u(): return db.get("channel", "TrustVaultMailsOfficial")
+def recovery_email(): return db.get("recovery_email", "")
+def master_password(): return db.get("master_password", "")
+def maintenance(): return db.get("maintenance", "0") == "1"
+def welcome(): return db.get("welcome", "🎉 বটে স্বাগতম!")
 
 
 def method_charge(m):
@@ -466,54 +552,42 @@ def kb_cancel(target="main_menu"):
 
 def kb_support():
     b = InlineKeyboardBuilder()
-    b.row(InlineKeyboardButton(
-        text="🧑‍💻 অ্যাডমিন",
-        url=f"https://t.me/{support_u()}",
-    ))
-    b.row(InlineKeyboardButton(
-        text="📢 চ্যানেল",
-        url=f"https://t.me/{channel_u()}",
-    ))
+    b.row(InlineKeyboardButton(text="🧑‍💻 অ্যাডমিন", url=f"https://t.me/{support_u()}"))
+    b.row(InlineKeyboardButton(text="📢 চ্যানেল", url=f"https://t.me/{channel_u()}"))
     b.row(InlineKeyboardButton(text="🔙 মেইন মেন্যু", callback_data="main_menu"))
     return b.as_markup()
 
 
-def kb_wallet_choice(g_bal, r_bal):
+def kb_categories_for_submit():
+    """ইউজারের জন্য ক্যাটাগরি লিস্ট।"""
+    cats = db.cats()
     b = InlineKeyboardBuilder()
-    b.row(InlineKeyboardButton(
-        text=f"📧 জিমেইল ({g_bal:g}৳)",
-        callback_data="w_g",
-    ))
-    b.row(InlineKeyboardButton(
-        text=f"🔗 রেফার ({r_bal:g}৳)",
-        callback_data="w_r",
-    ))
-    b.row(InlineKeyboardButton(text="❌ বাতিল", callback_data="main_menu"))
+    if not cats:
+        b.row(InlineKeyboardButton(text="⚠️ এখনো কোনো ক্যাটাগরি নেই",
+                                    callback_data="main_menu"))
+    else:
+        for c in cats:
+            b.row(InlineKeyboardButton(
+                text=f"{c['label']} — {c['rate']}৳",
+                callback_data=f"sub_cat_{c['key']}",
+            ))
+    b.row(InlineKeyboardButton(text="🔙 মেইন মেন্যু", callback_data="main_menu"))
     return b.as_markup()
 
 
-def kb_payment(kind):
-    b = InlineKeyboardBuilder()
-    b.row(
-        InlineKeyboardButton(text="বিকাশ", callback_data=f"pm_bkash_{kind}"),
-        InlineKeyboardButton(text="নগদ", callback_data=f"pm_nagad_{kind}"),
-    )
-    b.row(InlineKeyboardButton(text="রকেট", callback_data=f"pm_rocket_{kind}"))
-    b.row(InlineKeyboardButton(text="❌ বাতিল", callback_data="main_menu"))
-    return b.as_markup()
-
-
-def kb_admin():
+def kb_admin_panel():
     b = InlineKeyboardBuilder()
     b.row(InlineKeyboardButton(text="📦 স্টক যোগ", callback_data="a_stock_add"))
     b.row(InlineKeyboardButton(text="🗑️ স্টক ম্যানেজ", callback_data="a_stock_mg"))
-    b.row(InlineKeyboardButton(text="💌 রিকভারি ইমেইল", callback_data="a_recovery"))
-    b.row(InlineKeyboardButton(text="💰 রেট ম্যানেজ", callback_data="a_rate"))
+    b.row(InlineKeyboardButton(text="🗂️ ক্যাটাগরি ম্যানেজ", callback_data="a_cat_menu"))
+    b.row(InlineKeyboardButton(text="🔐 মাস্টার পাসওয়ার্ড সেট", callback_data="a_master_pw"))
+    b.row(InlineKeyboardButton(text="💌 রিকভারি ইমেইল সেট", callback_data="a_recovery"))
     b.row(InlineKeyboardButton(text="💵 উইথড্র লিমিট", callback_data="a_limits"))
     b.row(InlineKeyboardButton(text="💳 মেথড চার্জ", callback_data="a_mcharges"))
     b.row(InlineKeyboardButton(text="⚠️ ওয়ার্নিং লিমিট", callback_data="a_warn"))
     b.row(InlineKeyboardButton(text="🚫 ইউজার ব্যান", callback_data="a_ban"))
     b.row(InlineKeyboardButton(text="🔍 ইউজার লুকআপ", callback_data="a_lookup"))
+    b.row(InlineKeyboardButton(text="💰 ব্যালেন্স ম্যানেজ", callback_data="a_bal_menu"))
     b.row(InlineKeyboardButton(text="👑 অ্যাডমিন ম্যানেজ", callback_data="a_admins"))
     b.row(InlineKeyboardButton(text="🔗 রেফার কমিশন", callback_data="a_comm"))
     b.row(InlineKeyboardButton(text="📞 সাপোর্ট/চ্যানেল", callback_data="a_contact"))
@@ -545,13 +619,24 @@ def kb_admin_stock_clear_ok():
     return b.as_markup()
 
 
-def kb_admin_rate():
+def kb_admin_cat_menu():
     b = InlineKeyboardBuilder()
-    b.row(InlineKeyboardButton(
-        text=f"📦 স্টক রেট: {gmail_rate()}৳",
-        callback_data="a_setrate_stock",
-    ))
+    for c in db.cats():
+        b.row(InlineKeyboardButton(
+            text=f"🗑️ {c['label']} ({c['rate']}৳)",
+            callback_data=f"a_cat_del_{c['key']}",
+        ))
+    b.row(InlineKeyboardButton(text="➕ নতুন ক্যাটাগরি", callback_data="a_cat_add"))
     b.row(InlineKeyboardButton(text="🔙 অ্যাডমিন", callback_data="admin"))
+    return b.as_markup()
+
+
+def kb_admin_cat_del_confirm(key):
+    b = InlineKeyboardBuilder()
+    b.row(
+        InlineKeyboardButton(text="✅ হ্যাঁ, মুছুন", callback_data=f"a_cat_delok_{key}"),
+        InlineKeyboardButton(text="❌ না", callback_data="a_cat_menu"),
+    )
     return b.as_markup()
 
 
@@ -559,20 +644,16 @@ def kb_admin_limits():
     b = InlineKeyboardBuilder()
     b.row(InlineKeyboardButton(
         text=f"📧 জিমেইল মিন: {min_wd_g()}৳",
-        callback_data="a_setlim_gmail",
-    ))
+        callback_data="a_setlim_gmail"))
     b.row(InlineKeyboardButton(
         text=f"🔗 রেফার মিন: {min_wd_r()}৳",
-        callback_data="a_setlim_refer",
-    ))
+        callback_data="a_setlim_refer"))
     b.row(InlineKeyboardButton(
         text=f"🔗 রেফার চার্জ: {ref_charge()}৳",
-        callback_data="a_setlim_charge",
-    ))
+        callback_data="a_setlim_charge"))
     b.row(InlineKeyboardButton(
         text=f"🔗 ন্যূনতম রেফার: {min_refs()} জন",
-        callback_data="a_setlim_minrefs",
-    ))
+        callback_data="a_setlim_minrefs"))
     b.row(InlineKeyboardButton(text="🔙 অ্যাডমিন", callback_data="admin"))
     return b.as_markup()
 
@@ -582,22 +663,15 @@ def kb_admin_mcharges():
     for m, label in (("bkash", "বিকাশ"), ("nagad", "নগদ"), ("rocket", "রকেট")):
         b.row(InlineKeyboardButton(
             text=f"{label}: {method_charge(m)}৳",
-            callback_data=f"a_setmc_{m}",
-        ))
+            callback_data=f"a_setmc_{m}"))
     b.row(InlineKeyboardButton(text="🔙 অ্যাডমিন", callback_data="admin"))
     return b.as_markup()
 
 
 def kb_admin_contact():
     b = InlineKeyboardBuilder()
-    b.row(InlineKeyboardButton(
-        text="🧑‍💻 সাপোর্ট পরিবর্তন",
-        callback_data="a_setsup",
-    ))
-    b.row(InlineKeyboardButton(
-        text="📢 চ্যানেল পরিবর্তন",
-        callback_data="a_setch",
-    ))
+    b.row(InlineKeyboardButton(text="🧑‍💻 সাপোর্ট পরিবর্তন", callback_data="a_setsup"))
+    b.row(InlineKeyboardButton(text="📢 চ্যানেল পরিবর্তন", callback_data="a_setch"))
     b.row(InlineKeyboardButton(text="🔙 অ্যাডমিন", callback_data="admin"))
     return b.as_markup()
 
@@ -607,8 +681,7 @@ def kb_admin_admins():
     for aid in db.extra_admins():
         b.row(InlineKeyboardButton(
             text=f"➖ {aid} — বাদ দিন",
-            callback_data=f"a_deladmin_{aid}",
-        ))
+            callback_data=f"a_deladmin_{aid}"))
     b.row(InlineKeyboardButton(text="➕ নতুন অ্যাডমিন", callback_data="a_addadmin"))
     b.row(InlineKeyboardButton(text="🔙 অ্যাডমিন", callback_data="admin"))
     return b.as_markup()
@@ -617,6 +690,35 @@ def kb_admin_admins():
 def kb_admin_warn():
     b = InlineKeyboardBuilder()
     b.row(InlineKeyboardButton(text="✏️ পরিবর্তন", callback_data="a_setwarn"))
+    b.row(InlineKeyboardButton(text="🔙 অ্যাডমিন", callback_data="admin"))
+    return b.as_markup()
+
+
+def kb_admin_bal_menu():
+    b = InlineKeyboardBuilder()
+    b.row(InlineKeyboardButton(text="🔍 ইউজার আইডি দিয়ে সার্চ", callback_data="a_bal_search"))
+    b.row(InlineKeyboardButton(text="🧹 সব ইউজারের ব্যালেন্স ০ করুন", callback_data="a_bal_zero"))
+    b.row(InlineKeyboardButton(text="🔙 অ্যাডমিন", callback_data="admin"))
+    return b.as_markup()
+
+
+def kb_admin_bal_zero_ok():
+    b = InlineKeyboardBuilder()
+    b.row(
+        InlineKeyboardButton(text="✅ হ্যাঁ, সব ০ করুন", callback_data="a_bal_zero_ok"),
+        InlineKeyboardButton(text="❌ না", callback_data="a_bal_menu"),
+    )
+    return b.as_markup()
+
+
+def kb_admin_editbal(uid):
+    b = InlineKeyboardBuilder()
+    b.row(InlineKeyboardButton(
+        text="📧 জিমেইল ওয়ালেট",
+        callback_data=f"a_ebal_g_{uid}"))
+    b.row(InlineKeyboardButton(
+        text="🔗 রেফার ওয়ালেট",
+        callback_data=f"a_ebal_r_{uid}"))
     b.row(InlineKeyboardButton(text="🔙 অ্যাডমিন", callback_data="admin"))
     return b.as_markup()
 
@@ -639,17 +741,26 @@ def kb_admin_wd(wid):
     return b.as_markup()
 
 
-def kb_admin_editbal(uid):
+def kb_wallet_choice(g_bal, r_bal):
     b = InlineKeyboardBuilder()
     b.row(InlineKeyboardButton(
-        text="📧 জিমেইল ওয়ালেট",
-        callback_data=f"a_ebal_g_{uid}",
-    ))
+        text=f"📧 জিমেইল ({g_bal:g}৳)",
+        callback_data="w_g"))
     b.row(InlineKeyboardButton(
-        text="🔗 রেফার ওয়ালেট",
-        callback_data=f"a_ebal_r_{uid}",
-    ))
-    b.row(InlineKeyboardButton(text="🔙 অ্যাডমিন", callback_data="admin"))
+        text=f"🔗 রেফার ({r_bal:g}৳)",
+        callback_data="w_r"))
+    b.row(InlineKeyboardButton(text="❌ বাতিল", callback_data="main_menu"))
+    return b.as_markup()
+
+
+def kb_payment(kind):
+    b = InlineKeyboardBuilder()
+    b.row(
+        InlineKeyboardButton(text="বিকাশ", callback_data=f"pm_bkash_{kind}"),
+        InlineKeyboardButton(text="নগদ", callback_data=f"pm_nagad_{kind}"),
+    )
+    b.row(InlineKeyboardButton(text="রকেট", callback_data=f"pm_rocket_{kind}"))
+    b.row(InlineKeyboardButton(text="❌ বাতিল", callback_data="main_menu"))
     return b.as_markup()
 
 
@@ -697,7 +808,6 @@ async def send_chunked(chat, header, lines, markup=None):
         chunks.append(cur)
     if not chunks:
         chunks = [header]
-
     last = len(chunks) - 1
     for i, ch in enumerate(chunks):
         payload = {"chat_id": chat, "text": ch, "parse_mode": ParseMode.MARKDOWN}
@@ -708,7 +818,7 @@ async def send_chunked(chat, header, lines, markup=None):
         except Exception as e:
             log.warning(f"chunked fail: {e}")
 # ==========================================================
-# পার্ট ৩/৫ : User Handlers (/start, Profile, Refer, Submit)
+# পার্ট ৩/৫ : User Handlers (/start, Profile, Submit, Withdraw)
 # ==========================================================
 
 @router.message(CommandStart())
@@ -723,12 +833,11 @@ async def cmd_start(m: Message):
     if db.is_banned(uid) and not db.is_admin(uid):
         await m.answer("🚫 আপনাকে ব্যান করা হয়েছে। সাপোর্টে যোগাযোগ করুন।")
         return
-
     if maintenance() and not db.is_admin(uid):
         await m.answer("🚧 বট রক্ষণাবেক্ষণে আছে। পরে চেষ্টা করুন।")
         return
 
-    # Referral processing
+    # Referral
     parts = (m.text or "").split(maxsplit=1)
     if len(parts) > 1 and parts[1].strip().isdigit():
         ref = int(parts[1].strip())
@@ -739,8 +848,7 @@ async def cmd_start(m: Message):
                 await bot.send_message(
                     ref,
                     f"🎉 আপনার রেফার লিংক দিয়ে কেউ জয়েন করেছে!\n"
-                    f"সে কাজ সম্পন্ন করলে আপনি {refer_pct()}% কমিশন পাবেন।",
-                )
+                    f"সে কাজ সম্পন্ন করলে আপনি {refer_pct()}% কমিশন পাবেন।")
             except Exception:
                 pass
         else:
@@ -764,11 +872,9 @@ async def cb_main_menu(cb: CallbackQuery):
         return
     db.set_state(uid, "")
     await answer(cb)
-    await edit(
-        cb,
-        "✨ **মেইন মেন্যু** ✨\n\nএকটা অপশন বেছে নিন 👇",
-        reply_markup=kb_main(db.is_admin(uid)),
-    )
+    await edit(cb,
+               "✨ **মেইন মেন্যু** ✨\n\nএকটা অপশন বেছে নিন 👇",
+               reply_markup=kb_main(db.is_admin(uid)))
 
 
 @router.callback_query(F.data == "profile")
@@ -782,8 +888,7 @@ async def cb_profile(cb: CallbackQuery):
     g = r["gmail_wallet"] or 0
     rw = r["refer_wallet"] or 0
     total = g + rw
-    await edit(
-        cb,
+    await edit(cb,
         f"👤 **আপনার প্রোফাইল**\n\n"
         f"📧 জিমেইল সেল ওয়ালেট: `{g:g}` টাকা\n"
         f"🔗 রেফারেল ওয়ালেট: `{rw:g}` টাকা\n"
@@ -791,8 +896,7 @@ async def cb_profile(cb: CallbackQuery):
         f"👥 মোট রেফার: `{r['total_refers']}` জন\n"
         f"⚠️ ওয়ার্নিং: `{r['fake_warnings']}/{warn_limit()}`\n"
         f"🆔 ইউজার আইডি: `{uid}`",
-        reply_markup=kb_back(),
-    )
+        reply_markup=kb_back())
 
 
 @router.callback_query(F.data == "refer")
@@ -801,8 +905,7 @@ async def cb_refer(cb: CallbackQuery):
     await answer(cb)
     r = db.user(uid)
     link = f"https://t.me/{BOT_USERNAME}?start={uid}"
-    await edit(
-        cb,
+    await edit(cb,
         f"🎁 **My Referrals**\n\n"
         f"👤 Total Refer: `{r['total_refers']}`\n"
         f"💵 Total Refer Income: `{r['refer_income']:g}` টাকা\n"
@@ -810,36 +913,30 @@ async def cb_refer(cb: CallbackQuery):
         f"🔗 **আপনার রেফার লিংক:**\n`{link}`\n\n"
         f"ℹ️ আপনার প্রতিটা রেফারের সম্পূর্ণ করা কাজ থেকে আয়ের "
         f"**{refer_pct()}%** কমিশন পাবেন।",
-        reply_markup=kb_back(),
-    )
+        reply_markup=kb_back())
 
 
 @router.callback_query(F.data == "support")
 async def cb_support(cb: CallbackQuery):
     await answer(cb)
-    await edit(
-        cb,
-        "🆘 **সাপোর্ট সেন্টার**\n\n"
-        "নিচের বাটন থেকে যোগাযোগ করুন 👇",
-        reply_markup=kb_support(),
-    )
+    await edit(cb,
+               "🆘 **সাপোর্ট সেন্টার**\n\nনিচের বাটন থেকে যোগাযোগ করুন 👇",
+               reply_markup=kb_support())
 
 
 @router.callback_query(F.data == "stats")
 async def cb_stats(cb: CallbackQuery):
     await answer(cb)
-    await edit(
-        cb,
+    await edit(cb,
         f"📊 **বট স্ট্যাটিস্টিকস**\n\n"
         f"👥 মোট মেম্বার: `{db.total_users()}` জন\n"
         f"📦 স্টকে জিমেইল: `{db.stock_count()}` টি\n"
-        f"💸 প্রতি জিমেইল রেট: `{gmail_rate()}` টাকা",
-        reply_markup=kb_back(),
-    )
+        f"🗂️ ক্যাটাগরি: `{len(db.cats())}` টি",
+        reply_markup=kb_back())
 
 
 # ==========================================================
-# OLD GMAIL SUBMIT
+# SUBMIT — ক্যাটাগরি → মাস্টার পাসওয়ার্ড + রিকভারি → Gmail
 # ==========================================================
 
 @router.callback_query(F.data == "submit")
@@ -848,32 +945,56 @@ async def cb_submit(cb: CallbackQuery):
     if db.is_banned(uid) and not db.is_admin(uid):
         await answer(cb, "🚫 আপনি ব্যান হয়েছেন।", alert=True)
         return
-    rec = recovery()
-    if not rec:
-        await answer(
-            cb,
-            "⚠️ অ্যাডমিন এখনো ডিফল্ট রিকভারি ইমেইল সেট করেননি। পরে চেষ্টা করুন।",
-            alert=True,
-        )
+
+    cats = db.cats()
+    if not cats:
+        await answer(cb, "⚠️ অ্যাডমিন এখনো কোনো ক্যাটাগরি যোগ করেননি।", alert=True)
         return
-    db.set_state(uid, "w_gmail")
+
+    if not recovery_email():
+        await answer(cb, "⚠️ অ্যাডমিন রিকভারি ইমেইল সেট করেননি।", alert=True)
+        return
+    if not master_password():
+        await answer(cb, "⚠️ অ্যাডমিন মাস্টার পাসওয়ার্ড সেট করেননি।", alert=True)
+        return
+
     await answer(cb)
-    await edit(
-        cb,
-        f"♻️ **Old Gmail জমা দিন**\n\n"
-        f"⚠️ **গুরুত্বপূর্ণ:** জমা দেওয়ার আগে অবশ্যই আপনার Gmail-এ "
-        f"নিচের রিকভারি ইমেইলটি যোগ করে নিন।\n\n"
-        f"📧 **রিকভারি ইমেইল:** `{esc(rec)}`\n\n"
-        f"📝 **ফরম্যাট:**\n`ইমেইল:পাসওয়ার্ড`\n\n"
-        f"উদাহরণ:\n`myemail@gmail.com:mypassword123`\n\n"
-        f"💵 রেট: **{gmail_rate()} টাকা**",
-        reply_markup=kb_cancel(),
-    )
+    await edit(cb,
+               "♻️ **Old Gmail জমা দিন**\n\n"
+               "কোন ধরনের Gmail জমা দিতে চান? নিচে থেকে বেছে নিন 👇",
+               reply_markup=kb_categories_for_submit())
 
 
-@router.message(F.text, lambda m: db.state(m.from_user.id) == "w_gmail")
+@router.callback_query(F.data.startswith("sub_cat_"))
+async def cb_submit_category(cb: CallbackQuery):
+    uid = cb.from_user.id
+    key = cb.data.replace("sub_cat_", "", 1)
+    c = db.cat(key)
+    if not c:
+        await answer(cb, "❌ ক্যাটাগরি পাওয়া যায়নি", alert=True)
+        return
+
+    rec = recovery_email()
+    mp = master_password()
+    db.set_state(uid, f"w_gmail_{key}")
+
+    await answer(cb)
+    await edit(cb,
+        f"♻️ **{esc(c['label'])}** — জমা দিন\n\n"
+        f"⚠️ **গুরুত্বপূর্ণ:** জমা দেওয়ার আগে আপনার Gmail-এ "
+        f"নিচের দুটো জিনিস সেট করুন:\n\n"
+        f"💌 **রিকভারি ইমেইল:** `{esc(rec)}`\n"
+        f"🔐 **Gmail পাসওয়ার্ড:** `{esc(mp)}`\n\n"
+        f"📝 **এরপর শুধু আপনার Gmail এড্রেসটি লিখে পাঠান।**\n\n"
+        f"উদাহরণ:\n`myemail@gmail.com`\n\n"
+        f"💵 রেট: **{c['rate']} টাকা**",
+        reply_markup=kb_cancel())
+
+
+@router.message(F.text, lambda m: db.state(m.from_user.id).startswith("w_gmail_"))
 async def handle_gmail_submit(m: Message):
     uid = m.from_user.id
+    state = db.state(uid)
     text = (m.text or "").strip()
     db.set_state(uid, "")
 
@@ -881,48 +1002,40 @@ async def handle_gmail_submit(m: Message):
         await m.answer("🚫 আপনি ব্যান হয়েছেন।")
         return
 
-    if ":" not in text:
+    cat_key = state.replace("w_gmail_", "", 1)
+    c = db.cat(cat_key)
+    if not c:
+        await m.answer("❌ ক্যাটাগরি পাওয়া যায়নি। আবার শুরু করুন।",
+                       reply_markup=kb_back())
+        return
+
+    if not valid_gmail(text):
         await m.answer(
-            "⚠️ ফরম্যাট ভুল হয়েছে।\n\nএভাবে পাঠান:\n`ইমেইল:পাসওয়ার্ড`",
-            reply_markup=kb_cancel(),
-        )
+            "⚠️ এটা বৈধ Gmail (`@gmail.com`) নয়।\n\n"
+            "শুধু Gmail এড্রেস পাঠান, যেমন:\n`myemail@gmail.com`",
+            reply_markup=kb_cancel())
         return
 
-    parts = text.split(":", 1)
-    gmail = parts[0].strip()
-    pwd = parts[1].strip()
-
-    if not valid_gmail(gmail):
-        await m.answer(
-            "⚠️ এটা বৈধ Gmail (`@gmail.com`) অ্যাড্রেস নয়।\n\n"
-            "ফরম্যাট: `ইমেইল:পাসওয়ার্ড`",
-            reply_markup=kb_cancel(),
-        )
-        return
-
-    if not pwd:
-        await m.answer("⚠️ পাসওয়ার্ড খালি রাখা যাবে না।", reply_markup=kb_cancel())
-        return
-
-    if db.used(gmail):
+    if db.used(text):
         await m.answer(
             f"❌ **এই Gmail অ্যাকাউন্টটি ইতিমধ্যে জমা দেওয়া হয়েছে!**\n\n"
-            f"`{esc(gmail)}` — এটা আগে Accept হয়েছে বা এখনো রিভিউতে আছে।\n"
+            f"`{esc(text)}` — এটা আগে Accept হয়েছে বা এখনো রিভিউতে আছে।\n"
             f"একই অ্যাকাউন্ট বারবার জমা দেওয়া যাবে না।",
-            reply_markup=kb_back(),
-        )
+            reply_markup=kb_back())
         return
 
-    rec = recovery()
-    tid = db.new_task(uid, gmail, pwd, rec)
+    rec = recovery_email()
+    mp = master_password()
+    tid = db.new_task(uid, text, mp, rec, cat_key)
     dn = udisplay(uid)
 
     admin_text = (
-        f"♻️ **Old Gmail — ইউজার জমা দিয়েছেন!** (টাস্ক #{tid})\n\n"
+        f"♻️ **{esc(c['label'])} — ইউজার জমা দিয়েছেন!** (টাস্ক #{tid})\n\n"
         f"👤 ইউজার: **{esc(dn)}**\n"
-        f"📨 জিমেইল: `{esc(gmail)}`\n"
-        f"🔑 পাসওয়ার্ড: `{esc(pwd)}`\n"
-        f"💌 রিকভারি: `{esc(rec)}`\n\n"
+        f"📨 জিমেইল: `{esc(text)}`\n"
+        f"🔐 পাসওয়ার্ড: `{esc(mp)}`\n"
+        f"💌 রিকভারি: `{esc(rec)}`\n"
+        f"💵 রেট: `{c['rate']}` টাকা\n\n"
         f"(মেইলটি লগইন করে চেক করে বাটনে অ্যাকশন নিন)"
     )
 
@@ -937,8 +1050,7 @@ async def handle_gmail_submit(m: Message):
         "✅ আপনার কাজটি সফলভাবে জমা হয়েছে।\n\n"
         "এটি বর্তমানে অ্যাডমিন রিভিউতে আছে। অনুমোদিত হলে "
         "২৪ ঘণ্টার মধ্যে আপনার ব্যালেন্সে টাকা যোগ হবে।",
-        reply_markup=kb_back(),
-    )
+        reply_markup=kb_back())
 
 
 # ==========================================================
@@ -955,14 +1067,12 @@ async def cb_withdraw(cb: CallbackQuery):
         return
     g = r["gmail_wallet"] or 0
     rw = r["refer_wallet"] or 0
-    await edit(
-        cb,
+    await edit(cb,
         f"💳 **কোন ওয়ালেট থেকে উইথড্র করবেন?**\n\n"
         f"📧 জিমেইল সেল: `{g:g}` টাকা (মিন: `{min_wd_g()}`)\n"
         f"🔗 রেফারেল: `{rw:g}` টাকা (মিন: `{min_wd_r()}`, "
         f"চার্জ: `{ref_charge()}`, ন্যূনতম রেফার: `{min_refs()}`)",
-        reply_markup=kb_wallet_choice(g, rw),
-    )
+        reply_markup=kb_wallet_choice(g, rw))
 
 
 @router.callback_query(F.data.in_({"w_g", "w_r"}))
@@ -977,28 +1087,21 @@ async def cb_wallet_choice(cb: CallbackQuery):
 
     if kind == "refer":
         if (r["total_refers"] or 0) < min_refs():
-            await answer(
-                cb,
+            await answer(cb,
                 f"❌ রেফারেল উইথড্রর জন্য কমপক্ষে {min_refs()} জন রেফার লাগবে। "
-                f"আপনার আছে {r['total_refers']} জন।",
-                alert=True,
-            )
+                f"আপনার আছে {r['total_refers']} জন।", alert=True)
             return
 
     if bal < mn:
-        await answer(
-            cb,
+        await answer(cb,
             f"❌ {label} ওয়ালেটে পর্যাপ্ত ব্যালেন্স নেই! কমপক্ষে {mn} টাকা লাগবে।",
-            alert=True,
-        )
+            alert=True)
         return
 
     await answer(cb)
-    await edit(
-        cb,
-        f"💳 **পেমেন্ট মেথড বেছে নিন** ({label})",
-        reply_markup=kb_payment(kind),
-    )
+    await edit(cb,
+               f"💳 **পেমেন্ট মেথড বেছে নিন** ({label})",
+               reply_markup=kb_payment(kind))
 
 
 @router.callback_query(F.data.startswith("pm_"))
@@ -1007,15 +1110,12 @@ async def cb_payment_method(cb: CallbackQuery):
     rest = cb.data[3:]
     parts = rest.split("_", 1)
     method, kind = parts[0], parts[1]
-
     db.set_state(uid, f"w_wallet_{method}_{kind}")
     await answer(cb)
     label = {"bkash": "বিকাশ", "nagad": "নগদ", "rocket": "রকেট"}[method]
-    await edit(
-        cb,
-        f"📥 আপনার **{label}** পার্সোনাল নম্বরটি লিখে পাঠান:",
-        reply_markup=kb_cancel(),
-    )
+    await edit(cb,
+               f"📥 আপনার **{label}** পার্সোনাল নম্বরটি লিখে পাঠান:",
+               reply_markup=kb_cancel())
 
 
 @router.message(F.text, lambda m: db.state(m.from_user.id).startswith("w_wallet_"))
@@ -1045,8 +1145,7 @@ async def handle_wallet_number(m: Message):
     charge_note = (
         f"\n💸 চার্জ: `{total_charge:g}` টাকা\n"
         f"💵 প্রদেয় (নেট): **{net_amount:g} টাকা**"
-        if total_charge > 0 else ""
-    )
+        if total_charge > 0 else "")
 
     admin_text = (
         f"🚨 **নতুন উইথড্র রিকোয়েস্ট!** (আইডি #{wid})\n\n"
@@ -1067,10 +1166,9 @@ async def handle_wallet_number(m: Message):
     await m.answer(
         f"✅ **রিকোয়েস্ট পাঠানো হয়েছে!**{charge_note}\n\n"
         f"অ্যাডমিন টাকা পাঠানোর পর আপনাকে জানানো হবে।",
-        reply_markup=kb_back(),
-    )
+        reply_markup=kb_back())
 # ==========================================================
-# পার্ট ৪A/৫ : Admin Panel + Stock + Settings
+# পার্ট ৪/৫ : Admin Panel + Settings + Balance Management
 # ==========================================================
 
 def is_admin_cb(cb) -> bool:
@@ -1087,14 +1185,18 @@ async def cb_admin(cb: CallbackQuery):
         cb,
         f"👑 **অ্যাডমিন কন্ট্রোল প্যানেল**\n\n"
         f"📦 স্টক: `{db.stock_count()}` টি\n"
-        f"💌 রিকভারি: `{esc(recovery() or '(সেট হয়নি)')}`\n"
-        f"💰 রেট: `{gmail_rate()}` টাকা\n\n"
+        f"🗂️ ক্যাটাগরি: `{len(db.cats())}` টি\n"
+        f"💌 রিকভারি: `{esc(recovery_email() or '(সেট হয়নি)')}`\n"
+        f"🔐 মাস্টার পাসওয়ার্ড: `{esc(master_password() or '(সেট হয়নি)')}`\n\n"
         f"একটা অপশন বেছে নিন 👇",
-        reply_markup=kb_admin(),
+        reply_markup=kb_admin_panel(),
     )
 
 
-# ---------- STOCK ----------
+# ==========================================================
+# STOCK
+# ==========================================================
+
 @router.callback_query(F.data == "a_stock_add")
 async def cb_stock_add(cb: CallbackQuery):
     if not is_admin_cb(cb): return
@@ -1106,8 +1208,7 @@ async def cb_stock_add(cb: CallbackQuery):
         "ফরম্যাট:\n`ইমেইল:পাসওয়ার্ড`\n\n"
         "একাধিক হলে প্রতি লাইনে একটা:\n"
         "`a@gmail.com:pass1\nb@gmail.com:pass2`",
-        reply_markup=kb_cancel("admin"),
-    )
+        reply_markup=kb_cancel("admin"))
 
 
 @router.callback_query(F.data == "a_stock_mg")
@@ -1117,8 +1218,7 @@ async def cb_stock_mg(cb: CallbackQuery):
     await edit(
         cb,
         f"🗑️ **স্টক ম্যানেজমেন্ট**\n\nবর্তমানে: `{db.stock_count()}` টি জিমেইল",
-        reply_markup=kb_admin_stock(),
-    )
+        reply_markup=kb_admin_stock())
 
 
 @router.callback_query(F.data == "a_stock_view")
@@ -1133,11 +1233,8 @@ async def cb_stock_view(cb: CallbackQuery):
     lines = [f"{i}. `{esc(it['gmail'])}`" for i, it in enumerate(items, 1)]
     await edit(cb, f"📃 পাঠানো হচ্ছে... (মোট {len(items)} টি)",
                reply_markup=kb_back("a_stock_mg", "🔙 স্টক ম্যানেজ"))
-    await send_chunked(
-        cb.from_user.id,
-        f"📃 **স্টক লিস্ট** (মোট {len(items)} টি)",
-        lines,
-    )
+    await send_chunked(cb.from_user.id,
+                       f"📃 **স্টক লিস্ট** (মোট {len(items)} টি)", lines)
 
 
 @router.callback_query(F.data == "a_stock_del")
@@ -1149,8 +1246,7 @@ async def cb_stock_del(cb: CallbackQuery):
         cb,
         "🗑️ **ডিলিট করুন**\n\nএকাধিক হলে প্রতি লাইনে একটা:\n"
         "`a@gmail.com\nb@gmail.com`",
-        reply_markup=kb_cancel("a_stock_mg"),
-    )
+        reply_markup=kb_cancel("a_stock_mg"))
 
 
 @router.callback_query(F.data == "a_stock_clear")
@@ -1161,8 +1257,7 @@ async def cb_stock_clear(cb: CallbackQuery):
         cb,
         f"⚠️ সম্পূর্ণ স্টক (`{db.stock_count()}` টি) ক্লিয়ার করবেন?\n\n"
         f"ফিরিয়ে আনা যাবে না।",
-        reply_markup=kb_admin_stock_clear_ok(),
-    )
+        reply_markup=kb_admin_stock_clear_ok())
 
 
 @router.callback_query(F.data == "a_stock_clear_ok")
@@ -1175,7 +1270,93 @@ async def cb_stock_clear_ok(cb: CallbackQuery):
                reply_markup=kb_back("admin", "🔙 অ্যাডমিন"))
 
 
-# ---------- RECOVERY ----------
+# ==========================================================
+# CATEGORY MANAGEMENT
+# ==========================================================
+
+@router.callback_query(F.data == "a_cat_menu")
+async def cb_cat_menu(cb: CallbackQuery):
+    if not is_admin_cb(cb): return
+    await answer(cb)
+    await edit(
+        cb,
+        "🗂️ **ক্যাটাগরি ম্যানেজমেন্ট**\n\n"
+        "ইউজাররা 'Old Gmail জমা দিন' বাটনে ক্লিক করলে এই ক্যাটাগরিগুলো দেখবে।\n"
+        "মুছতে চাইলে সেটাতে ট্যাপ করুন।",
+        reply_markup=kb_admin_cat_menu())
+
+
+@router.callback_query(F.data == "a_cat_add")
+async def cb_cat_add(cb: CallbackQuery):
+    if not is_admin_cb(cb): return
+    db.set_state(cb.from_user.id, "a_w_cat_add")
+    await answer(cb)
+    await edit(
+        cb,
+        "➕ **নতুন ক্যাটাগরি যোগ করুন**\n\n"
+        "ফরম্যাট:\n`নাম | রেট`\n\n"
+        "উদাহরণ:\n"
+        "`1 Month Old | 25`\n"
+        "`2 Month Old | 30`",
+        reply_markup=kb_cancel("a_cat_menu"))
+
+
+@router.callback_query(F.data.startswith("a_cat_del_confirm_"))
+async def cb_cat_del_confirm(cb: CallbackQuery):
+    if not is_admin_cb(cb): return
+    key = cb.data.replace("a_cat_del_confirm_", "", 1)
+    await answer(cb)
+    db.del_cat(key)
+    await edit(cb,
+               "🗑️ ক্যাটাগরি মুছে ফেলা হয়েছে।",
+               reply_markup=kb_back("a_cat_menu", "🔙 ক্যাটাগরি মেনু"))
+
+
+@router.callback_query(F.data.startswith("a_cat_delok_"))
+async def cb_cat_delok(cb: CallbackQuery):
+    if not is_admin_cb(cb): return
+    key = cb.data.replace("a_cat_delok_", "", 1)
+    db.del_cat(key)
+    await answer(cb, "✅ মুছে ফেলা হয়েছে")
+    await edit(cb,
+               "🗑️ ক্যাটাগরি মুছে ফেলা হয়েছে।",
+               reply_markup=kb_back("a_cat_menu", "🔙 ক্যাটাগরি মেনু"))
+
+
+@router.callback_query(F.data.startswith("a_cat_del_"))
+async def cb_cat_del(cb: CallbackQuery):
+    if not is_admin_cb(cb): return
+    key = cb.data.replace("a_cat_del_", "", 1)
+    c = db.cat(key)
+    if not c:
+        await answer(cb, "❌ পাওয়া যায়নি", alert=True)
+        return
+    await answer(cb)
+    await edit(
+        cb,
+        f"⚠️ **{esc(c['label'])}** ক্যাটাগরি মুছবেন?",
+        reply_markup=kb_admin_cat_del_confirm(key))
+
+
+# ==========================================================
+# MASTER PASSWORD + RECOVERY EMAIL
+# ==========================================================
+
+@router.callback_query(F.data == "a_master_pw")
+async def cb_master_pw(cb: CallbackQuery):
+    if not is_admin_cb(cb): return
+    db.set_state(cb.from_user.id, "a_w_master_pw")
+    await answer(cb)
+    await edit(
+        cb,
+        f"🔐 **মাস্টার পাসওয়ার্ড সেট**\n\n"
+        f"বর্তমান: `{esc(master_password() or '(সেট হয়নি)')}`\n\n"
+        f"নতুন পাসওয়ার্ড লিখে পাঠান।\n\n"
+        f"ℹ️ ইউজাররা এই পাসওয়ার্ডটি নিজের Gmail-এ সেট করবে এবং "
+        f"শুধু Gmail এড্রেস জমা দেবে।",
+        reply_markup=kb_cancel("admin"))
+
+
 @router.callback_query(F.data == "a_recovery")
 async def cb_set_recovery(cb: CallbackQuery):
     if not is_admin_cb(cb): return
@@ -1184,33 +1365,15 @@ async def cb_set_recovery(cb: CallbackQuery):
     await edit(
         cb,
         f"💌 **ডিফল্ট রিকভারি ইমেইল**\n\n"
-        f"বর্তমান: `{esc(recovery() or '(সেট হয়নি)')}`\n\n"
+        f"বর্তমান: `{esc(recovery_email() or '(সেট হয়নি)')}`\n\n"
         f"নতুন রিকভারি ইমেইল লিখে পাঠান।",
-        reply_markup=kb_cancel("admin"),
-    )
+        reply_markup=kb_cancel("admin"))
 
 
-# ---------- RATE ----------
-@router.callback_query(F.data == "a_rate")
-async def cb_rate(cb: CallbackQuery):
-    if not is_admin_cb(cb): return
-    await answer(cb)
-    await edit(cb,
-               "💰 **রেট ম্যানেজমেন্ট**\n\nপরিবর্তন করতে ট্যাপ করুন:",
-               reply_markup=kb_admin_rate())
+# ==========================================================
+# LIMITS / METHOD CHARGES / WARNING
+# ==========================================================
 
-
-@router.callback_query(F.data == "a_setrate_stock")
-async def cb_setrate_stock(cb: CallbackQuery):
-    if not is_admin_cb(cb): return
-    db.set_state(cb.from_user.id, "a_w_rate_stock")
-    await answer(cb)
-    await edit(cb,
-               f"💰 **স্টক রেট**\n\nবর্তমান: `{gmail_rate()}` টাকা\n\nনতুন রেট (শুধু সংখ্যা):",
-               reply_markup=kb_cancel("a_rate"))
-
-
-# ---------- LIMITS ----------
 @router.callback_query(F.data == "a_limits")
 async def cb_limits(cb: CallbackQuery):
     if not is_admin_cb(cb): return
@@ -1240,7 +1403,6 @@ async def cb_setlim(cb: CallbackQuery):
                reply_markup=kb_cancel("a_limits"))
 
 
-# ---------- METHOD CHARGES ----------
 @router.callback_query(F.data == "a_mcharges")
 async def cb_mcharges(cb: CallbackQuery):
     if not is_admin_cb(cb): return
@@ -1264,7 +1426,6 @@ async def cb_setmc(cb: CallbackQuery):
                reply_markup=kb_cancel("a_mcharges"))
 
 
-# ---------- WARNING / BAN / LOOKUP ----------
 @router.callback_query(F.data == "a_warn")
 async def cb_warn(cb: CallbackQuery):
     if not is_admin_cb(cb): return
@@ -1273,8 +1434,7 @@ async def cb_warn(cb: CallbackQuery):
         cb,
         f"⚠️ **ওয়ার্নিং লিমিট**\n\nবর্তমান: `{warn_limit()}` বার\n\n"
         f"ℹ️ এতবার Reject হলে ইউজার অটো ব্যান হবে।",
-        reply_markup=kb_admin_warn(),
-    )
+        reply_markup=kb_admin_warn())
 
 
 @router.callback_query(F.data == "a_setwarn")
@@ -1287,6 +1447,10 @@ async def cb_setwarn(cb: CallbackQuery):
                reply_markup=kb_cancel("a_warn"))
 
 
+# ==========================================================
+# BAN / LOOKUP
+# ==========================================================
+
 @router.callback_query(F.data == "a_ban")
 async def cb_ban(cb: CallbackQuery):
     if not is_admin_cb(cb): return
@@ -1296,8 +1460,7 @@ async def cb_ban(cb: CallbackQuery):
         cb,
         "🚫 **ইউজার ব্যান/আনব্যান**\n\nইউজার **আইডি** পাঠান।\n"
         "ℹ️ ব্যান থাকলে আনব্যান হবে, না থাকলে ব্যান হবে।",
-        reply_markup=kb_cancel("admin"),
-    )
+        reply_markup=kb_cancel("admin"))
 
 
 @router.callback_query(F.data == "a_lookup")
@@ -1310,7 +1473,81 @@ async def cb_lookup(cb: CallbackQuery):
                reply_markup=kb_cancel("admin"))
 
 
-# ---------- ADMIN MANAGEMENT ----------
+# ==========================================================
+# BALANCE MANAGEMENT
+# ==========================================================
+
+@router.callback_query(F.data == "a_bal_menu")
+async def cb_bal_menu(cb: CallbackQuery):
+    if not is_admin_cb(cb): return
+    await answer(cb)
+    await edit(
+        cb,
+        "💰 **ব্যালেন্স ম্যানেজমেন্ট**\n\n"
+        "ℹ️ এখান থেকে যেকোনো ইউজারের ব্যালেন্স যোগ/কাট করতে পারবেন "
+        "এবং সব ইউজারের ব্যালেন্স ০ করতে পারবেন।",
+        reply_markup=kb_admin_bal_menu())
+
+
+@router.callback_query(F.data == "a_bal_search")
+async def cb_bal_search(cb: CallbackQuery):
+    if not is_admin_cb(cb): return
+    db.set_state(cb.from_user.id, "a_w_bal_search")
+    await answer(cb)
+    await edit(cb,
+               "🔍 যার ব্যালেন্স পরিবর্তন করবেন তার **ইউজার আইডি** পাঠান:",
+               reply_markup=kb_cancel("a_bal_menu"))
+
+
+@router.callback_query(F.data == "a_bal_zero")
+async def cb_bal_zero(cb: CallbackQuery):
+    if not is_admin_cb(cb): return
+    await answer(cb)
+    await edit(
+        cb,
+        f"⚠️ **সব ইউজারের ব্যালেন্স ০ করতে চান?**\n\n"
+        f"মোট ইউজার: `{db.total_users()}` জন\n\n"
+        f"এই কাজটি ফিরিয়ে আনা যাবে না!",
+        reply_markup=kb_admin_bal_zero_ok())
+
+
+@router.callback_query(F.data == "a_bal_zero_ok")
+async def cb_bal_zero_ok(cb: CallbackQuery):
+    if not is_admin_cb(cb): return
+    db.zero_all_wallets()
+    await answer(cb, "✅ সব ব্যালেন্স ০ করা হয়েছে")
+    await edit(
+        cb,
+        f"🧹 সব ইউজারের ব্যালেন্স ০ করা হয়েছে।",
+        reply_markup=kb_back("a_bal_menu", "🔙 ব্যালেন্স মেনু"))
+
+
+@router.callback_query(F.data.startswith("a_ebal_g_"))
+async def cb_editbal_g(cb: CallbackQuery):
+    if not is_admin_cb(cb): return
+    uid = cb.data.replace("a_ebal_g_", "", 1)
+    db.set_state(cb.from_user.id, f"a_w_ebal_g_{uid}")
+    await answer(cb)
+    await edit(cb,
+               "✍️ কত টাকা? (কমাতে চাইলে সামনে - দিন):",
+               reply_markup=kb_cancel("admin"))
+
+
+@router.callback_query(F.data.startswith("a_ebal_r_"))
+async def cb_editbal_r(cb: CallbackQuery):
+    if not is_admin_cb(cb): return
+    uid = cb.data.replace("a_ebal_r_", "", 1)
+    db.set_state(cb.from_user.id, f"a_w_ebal_r_{uid}")
+    await answer(cb)
+    await edit(cb,
+               "✍️ কত টাকা? (কমাতে চাইলে সামনে - দিন):",
+               reply_markup=kb_cancel("admin"))
+
+
+# ==========================================================
+# ADMINS / COMMISSION / CONTACT
+# ==========================================================
+
 @router.callback_query(F.data == "a_admins")
 async def cb_admins(cb: CallbackQuery):
     if not is_admin_cb(cb): return
@@ -1320,8 +1557,7 @@ async def cb_admins(cb: CallbackQuery):
         cb,
         f"👑 **অ্যাডমিন ম্যানেজমেন্ট**\n\n{core}\n\n"
         f"ℹ️ মূল অ্যাডমিন বাদ দেওয়া যাবে না।",
-        reply_markup=kb_admin_admins(),
-    )
+        reply_markup=kb_admin_admins())
 
 
 @router.callback_query(F.data == "a_addadmin")
@@ -1349,14 +1585,14 @@ async def cb_deladmin(cb: CallbackQuery):
                reply_markup=kb_back("a_admins", "🔙 অ্যাডমিন ম্যানেজ"))
 
 
-# ---------- COMMISSION / CONTACT ----------
 @router.callback_query(F.data == "a_comm")
 async def cb_comm(cb: CallbackQuery):
     if not is_admin_cb(cb): return
     db.set_state(cb.from_user.id, "a_w_comm")
     await answer(cb)
     await edit(cb,
-               f"🔗 **রেফার কমিশন**\n\nবর্তমান: `{refer_pct()}%`\n\nনতুন % (০-১০০):",
+               f"🔗 **রেফার কমিশন**\n\nবর্তমান: `{refer_pct()}%`\n\n"
+               f"নতুন % (০-১০০):",
                reply_markup=kb_cancel("admin"))
 
 
@@ -1369,8 +1605,7 @@ async def cb_contact(cb: CallbackQuery):
         f"📞 **সাপোর্ট/চ্যানেল**\n\n"
         f"🧑‍💻 সাপোর্ট: @{esc(support_u())}\n"
         f"📢 চ্যানেল: @{esc(channel_u())}",
-        reply_markup=kb_admin_contact(),
-    )
+        reply_markup=kb_admin_contact())
 
 
 @router.callback_query(F.data == "a_setsup")
@@ -1391,12 +1626,12 @@ async def cb_setch(cb: CallbackQuery):
     await edit(cb,
                "✍️ নতুন চ্যানেল ইউজারনেম (@ ছাড়া):",
                reply_markup=kb_cancel("a_contact"))
+
+
 # ==========================================================
-# পার্ট ৪B/৫ : Admin Actions (Maintenance, Backup, History, Broadcast)
-#             + Job Accept/Reject + Withdraw Paid/Reject
+# MAINTENANCE / BACKUP / HISTORY / TOP / BROADCAST
 # ==========================================================
 
-# ---------- MAINTENANCE ----------
 @router.callback_query(F.data == "a_maint")
 async def cb_maint(cb: CallbackQuery):
     if not is_admin_cb(cb): return
@@ -1409,7 +1644,6 @@ async def cb_maint(cb: CallbackQuery):
                reply_markup=kb_back("admin", "🔙 অ্যাডমিন"))
 
 
-# ---------- BACKUP ----------
 @router.callback_query(F.data == "a_backup")
 async def cb_backup(cb: CallbackQuery):
     if not is_admin_cb(cb): return
@@ -1427,15 +1661,13 @@ async def cb_backup(cb: CallbackQuery):
         await bot.send_message(cb.from_user.id, f"❌ ব্যাকআপ ব্যর্থ: {e}")
 
 
-# ---------- HISTORY ----------
 @router.callback_query(F.data == "a_ghist")
 async def cb_ghist(cb: CallbackQuery):
     if not is_admin_cb(cb): return
     await answer(cb)
     h = db.history(limit=100)
     if not h:
-        await edit(cb,
-                   "📜 এখনো কোনো জিমেইল Accept/Reject হয়নি।",
+        await edit(cb, "📜 এখনো কোনো জিমেইল Accept/Reject হয়নি।",
                    reply_markup=kb_back("admin", "🔙 অ্যাডমিন"))
         return
     lines = []
@@ -1445,15 +1677,13 @@ async def cb_ghist(cb: CallbackQuery):
             f"{icon} #{x['task_id']} — {x['status'].capitalize()}\n"
             f"👤 {esc(x['username'])}\n"
             f"📨 `{esc(x['gmail'])}`\n"
+            f"🗂️ {esc(x.get('category', '') or 'old')}\n"
             f"👑 {esc(x['admin'])}\n"
-            f"🕐 {x['timestamp'][:19]}"
-        )
-    await edit(cb,
-               f"📜 জিমেইল হিস্টোরি (মোট {len(h)}টি) পাঠানো হচ্ছে...",
+            f"🕐 {x['timestamp'][:19]}")
+    await edit(cb, f"📜 জিমেইল হিস্টোরি (মোট {len(h)}টি) পাঠানো হচ্ছে...",
                reply_markup=kb_back("admin", "🔙 অ্যাডমিন"))
     await send_chunked(cb.from_user.id,
-                       f"📜 **জিমেইল হিস্টোরি** (মোট {len(h)}টি)",
-                       lines)
+                       f"📜 **জিমেইল হিস্টোরি** (মোট {len(h)}টি)", lines)
 
 
 @router.callback_query(F.data == "a_whist")
@@ -1462,8 +1692,7 @@ async def cb_whist(cb: CallbackQuery):
     await answer(cb)
     h = db.wd_history(limit=100)
     if not h:
-        await edit(cb,
-                   "💳 এখনো কোনো উইথড্র হয়নি।",
+        await edit(cb, "💳 এখনো কোনো উইথড্র হয়নি।",
                    reply_markup=kb_back("admin", "🔙 অ্যাডমিন"))
         return
     lines = []
@@ -1475,14 +1704,11 @@ async def cb_whist(cb: CallbackQuery):
             f"💰 `{x['amount']:g}` টাকা — {x['method']}\n"
             f"📞 `{esc(x['wallet'])}`\n"
             f"👑 {esc(x['admin'])}\n"
-            f"🕐 {x['timestamp'][:19]}"
-        )
-    await edit(cb,
-               f"💳 পেমেন্ট হিস্টোরি (মোট {len(h)}টি) পাঠানো হচ্ছে...",
+            f"🕐 {x['timestamp'][:19]}")
+    await edit(cb, f"💳 পেমেন্ট হিস্টোরি (মোট {len(h)}টি) পাঠানো হচ্ছে...",
                reply_markup=kb_back("admin", "🔙 অ্যাডমিন"))
     await send_chunked(cb.from_user.id,
-                       f"💳 **পেমেন্ট হিস্টোরি** (মোট {len(h)}টি)",
-                       lines)
+                       f"💳 **পেমেন্ট হিস্টোরি** (মোট {len(h)}টি)", lines)
 
 
 @router.callback_query(F.data == "a_top")
@@ -1502,8 +1728,7 @@ async def cb_top(cb: CallbackQuery):
     await edit(cb, "🏆 **টপ রেফারার**",
                reply_markup=kb_back("admin", "🔙 অ্যাডমিন"))
     await send_chunked(cb.from_user.id,
-                       "🏆 **টপ রেফারার র‍্যাঙ্কিং**",
-                       lines)
+                       "🏆 **টপ রেফারার র‍্যাঙ্কিং**", lines)
 
 
 @router.callback_query(F.data == "a_bc")
@@ -1515,12 +1740,9 @@ async def cb_bc(cb: CallbackQuery):
         cb,
         "📢 **ব্রডকাস্ট নোটিশ**\n\nযে মেসেজটি সব ইউজারের কাছে পাঠাতে চান সেটি পাঠান।\n"
         "টেক্সট, ছবি, ভিডিও — যেকোনো কিছু পাঠাতে পারেন।",
-        reply_markup=kb_cancel("admin"),
-    )
-
-
+        reply_markup=kb_cancel("admin"))
 # ==========================================================
-# JOB ACCEPT / REJECT
+# পার্ট ৫A : Job Accept/Reject + Withdraw Paid/Reject
 # ==========================================================
 
 @router.callback_query(F.data.startswith("aj_"))
@@ -1539,9 +1761,11 @@ async def cb_accept_job(cb: CallbackQuery):
         return
 
     target_uid = task["user_id"]
-    rate = gmail_rate()
     gmail = task["gmail"]
     pwd = task["password"]
+    cat_key = task["category"] or "old"
+    c = db.cat(cat_key)
+    rate = c["rate"] if c else 0
 
     db.add_wallet(target_uid, "gmail_wallet", rate)
     db.mark_used(gmail)
@@ -1555,21 +1779,19 @@ async def cb_accept_job(cb: CallbackQuery):
         try:
             await bot.send_message(
                 referrer_id,
-                f"💰 আপনার রেফারের কাজ অনুমোদিত!\nকমিশন: **{comm:g} টাকা**",
-            )
+                f"💰 আপনার রেফারের কাজ অনুমোদিত!\nকমিশন: **{comm:g} টাকা**")
         except Exception:
             pass
 
     dn = udisplay(target_uid, u)
     admin_name = udisplay(cb.from_user.id, None)
-    db.add_history(tid, target_uid, dn, gmail, pwd, "accepted", rate, admin_name)
+    db.add_history(tid, target_uid, dn, gmail, pwd, cat_key, "accepted", rate, admin_name)
 
     try:
         await bot.send_message(
             target_uid,
             f"✅ **অভিনন্দন!** আপনার Gmail অনুমোদিত হয়েছে।\n"
-            f"💰 **{rate} টাকা** জিমেইল সেল ওয়ালেটে যোগ হয়েছে।",
-        )
+            f"💰 **{rate} টাকা** জিমেইল সেল ওয়ালেটে যোগ হয়েছে।")
     except Exception:
         pass
 
@@ -1577,8 +1799,7 @@ async def cb_accept_job(cb: CallbackQuery):
     await cb.message.edit_text(
         f"🟢 **জিমেইল Accept!** (টাস্ক #{tid})\n\n"
         f"ইউজার: {esc(dn)}\n💰 {rate} টাকা দেওয়া হয়েছে।",
-        reply_markup=None,
-    )
+        reply_markup=None)
 
     try:
         msgs = json.loads(task["admin_msgs"] or "[]")
@@ -1591,8 +1812,7 @@ async def cb_accept_job(cb: CallbackQuery):
                 chat_id=int(mm["c"]),
                 message_id=int(mm["m"]),
                 text=f"🟢 **Accept হয়ে গেছে** (টাস্ক #{tid})\n{esc(admin_name)} এক্সেপ্ট করেছেন।",
-                reply_markup=None,
-            )
+                reply_markup=None)
         except Exception:
             pass
 
@@ -1615,6 +1835,7 @@ async def cb_reject_job(cb: CallbackQuery):
     target_uid = task["user_id"]
     gmail = task["gmail"]
     pwd = task["password"]
+    cat_key = task["category"] or "old"
     db.del_task(tid)
 
     warn = db.inc_warning(target_uid)
@@ -1627,15 +1848,14 @@ async def cb_reject_job(cb: CallbackQuery):
     u = db.user(target_uid)
     dn = udisplay(target_uid, u)
     admin_name = udisplay(cb.from_user.id, None)
-    db.add_history(tid, target_uid, dn, gmail, pwd, "rejected", 0, admin_name)
+    db.add_history(tid, target_uid, dn, gmail, pwd, cat_key, "rejected", 0, admin_name)
 
     if auto_ban:
         try:
             await bot.send_message(
                 target_uid,
                 f"🚫 **আপনাকে অটো-ব্যান করা হয়েছে!**\n"
-                f"বারবার ({lim} বার) ভুয়া/অচল জিমেইল জমা দিয়েছেন।",
-            )
+                f"বারবার ({lim} বার) ভুয়া/অচল জিমেইল জমা দিয়েছেন।")
         except Exception:
             pass
         note = f"\n\n🚫 ইউজার অটো-ব্যান হয়েছে (ওয়ার্নিং {warn}/{lim})।"
@@ -1644,8 +1864,7 @@ async def cb_reject_job(cb: CallbackQuery):
             await bot.send_message(
                 target_uid,
                 f"❌ **দুঃখিত!** আপনার জিমেইল বাতিল হয়েছে।\n"
-                f"⚠️ ওয়ার্নিং: {warn}/{lim}",
-            )
+                f"⚠️ ওয়ার্নিং: {warn}/{lim}")
         except Exception:
             pass
         note = f"\n⚠️ ওয়ার্নিং: {warn}/{lim}"
@@ -1654,8 +1873,7 @@ async def cb_reject_job(cb: CallbackQuery):
     await cb.message.edit_text(
         f"🔴 **জিমেইল Reject!** (টাস্ক #{tid})\n\n"
         f"ইউজার: {esc(dn)}{note}",
-        reply_markup=None,
-    )
+        reply_markup=None)
 
     try:
         msgs = json.loads(task["admin_msgs"] or "[]")
@@ -1668,15 +1886,10 @@ async def cb_reject_job(cb: CallbackQuery):
                 chat_id=int(mm["c"]),
                 message_id=int(mm["m"]),
                 text=f"🔴 **Reject হয়ে গেছে** (টাস্ক #{tid})\n{esc(admin_name)} রিজেক্ট করেছেন।{note}",
-                reply_markup=None,
-            )
+                reply_markup=None)
         except Exception:
             pass
 
-
-# ==========================================================
-# WITHDRAW PAID / REJECT
-# ==========================================================
 
 @router.callback_query(F.data.startswith("aw_"))
 async def cb_paid_wd(cb: CallbackQuery):
@@ -1706,8 +1919,7 @@ async def cb_paid_wd(cb: CallbackQuery):
     try:
         await bot.send_message(
             target_uid,
-            f"✅ **অভিনন্দন!**\n\nআপনার **{amount:g} টাকা**-এর উইথড্র পেমেন্ট সম্পন্ন হয়েছে। 🎉",
-        )
+            f"✅ **অভিনন্দন!**\n\nআপনার **{amount:g} টাকা**-এর উইথড্র পেমেন্ট সম্পন্ন হয়েছে। 🎉")
     except Exception:
         pass
 
@@ -1715,8 +1927,7 @@ async def cb_paid_wd(cb: CallbackQuery):
     await cb.message.edit_text(
         f"🟢 **পেমেন্ট কমপ্লিট!** (আইডি #{wid})\n\n"
         f"ইউজার: {esc(dn)} — {amount:g} টাকা পেমেন্ট দেওয়া হয়েছে।",
-        reply_markup=None,
-    )
+        reply_markup=None)
 
     try:
         msgs = json.loads(wd["admin_msgs"] or "[]")
@@ -1729,8 +1940,7 @@ async def cb_paid_wd(cb: CallbackQuery):
                 chat_id=int(mm["c"]),
                 message_id=int(mm["m"]),
                 text=f"🟢 **পেমেন্ট কমপ্লিট** (আইডি #{wid})\n{esc(admin_name)} পেমেন্ট করেছেন।",
-                reply_markup=None,
-            )
+                reply_markup=None)
         except Exception:
             pass
 
@@ -1766,8 +1976,7 @@ async def cb_reject_wd(cb: CallbackQuery):
         await bot.send_message(
             target_uid,
             f"❌ **দুঃখিত!** আপনার `{refund:g}` টাকার উইথড্র বাতিল হয়েছে।\n"
-            f"টাকা ফেরত দেওয়া হয়েছে।",
-        )
+            f"টাকা ফেরত দেওয়া হয়েছে।")
     except Exception:
         pass
 
@@ -1775,8 +1984,7 @@ async def cb_reject_wd(cb: CallbackQuery):
     await cb.message.edit_text(
         f"🔴 **উইথড্র Reject!** (আইডি #{wid})\n\n"
         f"ইউজার: {esc(dn)} — {refund:g} টাকা ফেরত দেওয়া হয়েছে।",
-        reply_markup=None,
-    )
+        reply_markup=None)
 
     try:
         msgs = json.loads(wd["admin_msgs"] or "[]")
@@ -1789,38 +1997,11 @@ async def cb_reject_wd(cb: CallbackQuery):
                 chat_id=int(mm["c"]),
                 message_id=int(mm["m"]),
                 text=f"🔴 **উইথড্র Reject** (আইডি #{wid})\n{esc(admin_name)} রিজেক্ট করেছেন।",
-                reply_markup=None,
-            )
+                reply_markup=None)
         except Exception:
             pass
-
-
 # ==========================================================
-# EDIT BALANCE (ADMIN)
-# ==========================================================
-
-@router.callback_query(F.data.startswith("a_ebal_g_"))
-async def cb_editbal_g(cb: CallbackQuery):
-    if not is_admin_cb(cb): return
-    uid = cb.data.replace("a_ebal_g_", "", 1)
-    db.set_state(cb.from_user.id, f"a_w_ebal_g_{uid}")
-    await answer(cb)
-    await edit(cb,
-               "✍️ কত টাকা? (কমাতে চাইলে সামনে - দিন):",
-               reply_markup=kb_cancel("admin"))
-
-
-@router.callback_query(F.data.startswith("a_ebal_r_"))
-async def cb_editbal_r(cb: CallbackQuery):
-    if not is_admin_cb(cb): return
-    uid = cb.data.replace("a_ebal_r_", "", 1)
-    db.set_state(cb.from_user.id, f"a_w_ebal_r_{uid}")
-    await answer(cb)
-    await edit(cb,
-               "✍️ কত টাকা? (কমাতে চাইলে সামনে - দিন):",
-               reply_markup=kb_cancel("admin"))
-# ==========================================================
-# পার্ট ৫/৫ : Admin Text Input + main() + Webhook
+# পার্ট ৫B : Admin Text Input + Fallback + main()
 # ==========================================================
 
 @router.message(F.text, lambda m: db.is_admin(m.from_user.id) and db.state(m.from_user.id).startswith("a_w_"))
@@ -1829,23 +2010,27 @@ async def dispatch_admin_input(m: Message):
     state = db.state(uid)
     text = (m.text or "").strip()
 
-    # ---------- STOCK ADD ----------
+    # ---------- 1. STOCK ADD ----------
     if state == "a_w_stock":
         db.set_state(uid, "")
         existing = {it["gmail"].lower() for it in db.stock_list(limit=10000)}
         added = dups = invalid = 0
         for line in text.split("\n"):
             line = line.strip()
-            if ":" not in line: continue
+            if ":" not in line:
+                continue
             parts = line.split(":", 1)
             g = parts[0].strip()
             p = parts[1].strip()
             if not valid_gmail(g):
-                invalid += 1; continue
+                invalid += 1
+                continue
             if g.lower() in existing:
-                dups += 1; continue
+                dups += 1
+                continue
             if db.add_stock(g, p):
-                existing.add(g.lower()); added += 1
+                existing.add(g.lower())
+                added += 1
             else:
                 dups += 1
         n1 = f"\n⚠️ `{dups}` ডুপ্লিকেট বাদ।" if dups else ""
@@ -1854,7 +2039,7 @@ async def dispatch_admin_input(m: Message):
                        reply_markup=kb_back("admin", "🔙 অ্যাডমিন"))
         return
 
-    # ---------- STOCK DELETE ----------
+    # ---------- 2. STOCK DELETE ----------
     if state == "a_w_stockdel":
         db.set_state(uid, "")
         targets = [t.strip() for t in text.split("\n") if t.strip()]
@@ -1863,39 +2048,71 @@ async def dispatch_admin_input(m: Message):
                        reply_markup=kb_back("a_stock_mg", "🔙 স্টক ম্যানেজ"))
         return
 
-    # ---------- RECOVERY ----------
+    # ---------- 3. CATEGORY ADD ----------
+    if state == "a_w_cat_add":
+        if "|" not in text:
+            await m.answer("⚠️ ফরম্যাট: `নাম | রেট`", parse_mode=ParseMode.MARKDOWN)
+            return
+        db.set_state(uid, "")
+        parts = text.split("|", 1)
+        label = parts[0].strip()
+        try:
+            rate = int(parts[1].strip())
+            if rate <= 0:
+                raise ValueError
+        except ValueError:
+            await m.answer("⚠️ রেট পজিটিভ সংখ্যা দিন।")
+            return
+        if not label:
+            await m.answer("⚠️ নাম খালি রাখা যাবে না।")
+            return
+        existing = {c["key"] for c in db.cats()}
+        i = 1
+        while f"cat{i}" in existing:
+            i += 1
+        key = f"cat{i}"
+        db.add_cat(key, label, rate)
+        await m.answer(
+            f"✅ নতুন ক্যাটাগরি যোগ হয়েছে!\n\n"
+            f"**{esc(label)}** — `{rate}` টাকা",
+            reply_markup=kb_back("a_cat_menu", "🔙 ক্যাটাগরি মেনু"))
+        return
+
+    # ---------- 4. MASTER PASSWORD ----------
+    if state == "a_w_master_pw":
+        db.set_state(uid, "")
+        if not text or len(text) < 3:
+            await m.answer("⚠️ কমপক্ষে ৩ অক্ষরের পাসওয়ার্ড দিন।")
+            return
+        db.set("master_password", text)
+        await m.answer(
+            f"✅ মাস্টার পাসওয়ার্ড সেট হয়েছে:\n`{esc(text)}`",
+            reply_markup=kb_back("admin", "🔙 অ্যাডমিন"))
+        return
+
+    # ---------- 5. RECOVERY EMAIL ----------
     if state == "a_w_recovery":
         db.set_state(uid, "")
         if not valid_gmail(text):
             await m.answer("⚠️ বৈধ Gmail দিন।",
                            reply_markup=kb_cancel("admin"))
             return
-        db.set("recovery", text)
-        await m.answer(f"✅ ডিফল্ট রিকভারি: `{esc(text)}`",
-                       reply_markup=kb_back("admin", "🔙 অ্যাডমিন"))
+        db.set("recovery_email", text)
+        await m.answer(
+            f"✅ ডিফল্ট রিকভারি: `{esc(text)}`",
+            reply_markup=kb_back("admin", "🔙 অ্যাডমিন"))
         return
 
-    # ---------- RATE ----------
-    if state == "a_w_rate_stock":
-        try:
-            val = int(text)
-            if val <= 0: raise ValueError
-        except ValueError:
-            await m.answer("⚠️ পজিটিভ সংখ্যা দিন।"); return
-        db.set_state(uid, "")
-        db.set("gmail_rate", val)
-        await m.answer(f"✅ স্টক রেট **{val} টাকা** সেট হয়েছে।",
-                       reply_markup=kb_back("a_rate", "🔙 রেট মেনু"))
-        return
-
-    # ---------- LIMITS ----------
+    # ---------- 6. LIMITS ----------
     if state.startswith("a_w_lim_"):
         key = state.replace("a_w_lim_", "", 1)
         try:
             val = int(text)
-            if val < 0: raise ValueError
+            if val < 0:
+                raise ValueError
         except ValueError:
-            await m.answer("⚠️ সঠিক সংখ্যা দিন।"); return
+            await m.answer("⚠️ সঠিক সংখ্যা দিন।")
+            return
         db.set_state(uid, "")
         smap = {
             "gmail": "min_wd_gmail",
@@ -1909,44 +2126,53 @@ async def dispatch_admin_input(m: Message):
             "charge": "রেফার চার্জ",
             "minrefs": "ন্যূনতম রেফার",
         }
-        if key not in smap: return
+        if key not in smap:
+            return
         db.set(smap[key], val)
-        await m.answer(f"✅ {labels[key]} **{val}** সেট হয়েছে।",
-                       reply_markup=kb_back("a_limits", "🔙 লিমিট"))
+        await m.answer(
+            f"✅ {labels[key]} **{val}** সেট হয়েছে।",
+            reply_markup=kb_back("a_limits", "🔙 লিমিট"))
         return
 
-    # ---------- METHOD CHARGE ----------
+    # ---------- 7. METHOD CHARGE ----------
     if state.startswith("a_w_mc_"):
         m_key = state.replace("a_w_mc_", "", 1)
         try:
             val = int(text)
-            if val < 0: raise ValueError
+            if val < 0:
+                raise ValueError
         except ValueError:
-            await m.answer("⚠️ সঠিক সংখ্যা দিন।"); return
+            await m.answer("⚠️ সঠিক সংখ্যা দিন।")
+            return
         db.set_state(uid, "")
         set_method_charge(m_key, val)
-        await m.answer(f"✅ {m_key} চার্জ **{val} টাকা** সেট।",
-                       reply_markup=kb_back("a_mcharges", "🔙 চার্জ মেনু"))
+        await m.answer(
+            f"✅ {m_key} চার্জ **{val} টাকা** সেট।",
+            reply_markup=kb_back("a_mcharges", "🔙 চার্জ মেনু"))
         return
 
-    # ---------- WARNING LIMIT ----------
+    # ---------- 8. WARNING LIMIT ----------
     if state == "a_w_warn":
         try:
             val = int(text)
-            if val <= 0: raise ValueError
+            if val <= 0:
+                raise ValueError
         except ValueError:
-            await m.answer("⚠️ পজিটিভ সংখ্যা দিন।"); return
+            await m.answer("⚠️ পজিটিভ সংখ্যা দিন।")
+            return
         db.set_state(uid, "")
         db.set("warning_limit", val)
-        await m.answer(f"✅ ওয়ার্নিং লিমিট: **{val}**",
-                       reply_markup=kb_back("admin", "🔙 অ্যাডমিন"))
+        await m.answer(
+            f"✅ ওয়ার্নিং লিমিট: **{val}**",
+            reply_markup=kb_back("admin", "🔙 অ্যাডমিন"))
         return
 
-    # ---------- BAN ----------
+    # ---------- 9. BAN ----------
     if state == "a_w_ban":
         db.set_state(uid, "")
         if not text.isdigit():
-            await m.answer("⚠️ সঠিক আইডি দিন।"); return
+            await m.answer("⚠️ সঠিক আইডি দিন।")
+            return
         target = int(text)
         r = db.user(target)
         if not r:
@@ -1968,11 +2194,12 @@ async def dispatch_admin_input(m: Message):
                 pass
         return
 
-    # ---------- LOOKUP ----------
+    # ---------- 10. LOOKUP ----------
     if state == "a_w_lookup":
         db.set_state(uid, "")
         if not text.isdigit():
-            await m.answer("⚠️ সঠিক আইডি দিন।"); return
+            await m.answer("⚠️ সঠিক আইডি দিন।")
+            return
         target = int(text)
         r = db.user(target)
         if not r:
@@ -1995,93 +2222,31 @@ async def dispatch_admin_input(m: Message):
             f"⚠️ ওয়ার্নিং: `{r['fake_warnings']}/{warn_limit()}`\n\n"
             f"📧 সাবমিশন (মোট {len(h)} — 🟢 {acc} | 🔴 {rej})"
         )
-        b = InlineKeyboardBuilder()
-        b.row(InlineKeyboardButton(
-            text="💰 ব্যালেন্স যোগ/বিয়োগ",
-            callback_data=f"a_ebal_g_{target}",
-        ))
-        b.row(InlineKeyboardButton(
-            text="🔗 রেফার ওয়ালেট",
-            callback_data=f"a_ebal_r_{target}",
-        ))
-        b.row(InlineKeyboardButton(text="🔙 অ্যাডমিন", callback_data="admin"))
-        await m.answer(out, reply_markup=b.as_markup())
+        await m.answer(out, reply_markup=kb_admin_editbal(target))
         return
 
-    # ---------- ADD ADMIN ----------
-    if state == "a_w_addadmin":
+    # ---------- 11. BALANCE SEARCH ----------
+    if state == "a_w_bal_search":
         db.set_state(uid, "")
         if not text.isdigit():
-            await m.answer("⚠️ সঠিক আইডি দিন।"); return
-        target = int(text)
-        if target in ADMIN_IDS or target in db.extra_admins():
-            await m.answer(f"ℹ️ `{target}` ইতিমধ্যে অ্যাডমিন।",
-                           reply_markup=kb_back("admin", "🔙 অ্যাডমিন"))
+            await m.answer("⚠️ সঠিক আইডি দিন।")
             return
-        db.add_admin(target)
-        await m.answer(f"✅ `{target}` অ্যাডমিন হয়েছে।",
-                       reply_markup=kb_back("admin", "🔙 অ্যাডমিন"))
-        try:
-            await bot.send_message(target,
-                "🎉 আপনাকে অ্যাডমিন করা হয়েছে! /start দিন।")
-        except Exception:
-            pass
+        target = int(text)
+        r = db.user(target)
+        if not r:
+            await m.answer("❌ এই আইডির ইউজার নেই।",
+                           reply_markup=kb_back("a_bal_menu", "🔙 ব্যালেন্স"))
+            return
+        out = (
+            f"💰 **ইউজার:** {esc(udisplay(target, r))}\n"
+            f"আইডি: `{target}`\n\n"
+            f"📧 জিমেইল: `{r['gmail_wallet']:g}` টাকা\n"
+            f"🔗 রেফার: `{r['refer_wallet']:g}` টাকা"
+        )
+        await m.answer(out, reply_markup=kb_admin_editbal(target))
         return
 
-    # ---------- COMMISSION ----------
-    if state == "a_w_comm":
-        try:
-            val = int(text)
-            if val < 0 or val > 100: raise ValueError
-        except ValueError:
-            await m.answer("⚠️ ০-১০০ এর মধ্যে দিন।"); return
-        db.set_state(uid, "")
-        db.set("refer_percent", val)
-        await m.answer(f"✅ কমিশন **{val}%** সেট।",
-                       reply_markup=kb_back("admin", "🔙 অ্যাডমিন"))
-        return
-
-    # ---------- CONTACT ----------
-    if state == "a_w_sup":
-        db.set_state(uid, "")
-        clean = text.lstrip("@").strip()
-        if not clean:
-            await m.answer("⚠️ সঠিক ইউজারনেম দিন।"); return
-        db.set("support", clean)
-        await m.answer(f"✅ সাপোর্ট: @{clean}",
-                       reply_markup=kb_back("admin", "🔙 অ্যাডমিন"))
-        return
-
-    if state == "a_w_ch":
-        db.set_state(uid, "")
-        clean = text.lstrip("@").strip()
-        if not clean:
-            await m.answer("⚠️ সঠিক ইউজারনেম দিন।"); return
-        db.set("channel", clean)
-        await m.answer(f"✅ চ্যানেল: @{clean}",
-                       reply_markup=kb_back("admin", "🔙 অ্যাডমিন"))
-        return
-
-    # ---------- BROADCAST ----------
-    if state == "a_w_bc":
-        db.set_state(uid, "")
-        await m.answer("📢 ব্রডকাস্ট পাঠানো হচ্ছে...")
-        ok = 0
-        for u in db.all_uids():
-            try:
-                await bot.copy_message(
-                    chat_id=u,
-                    from_chat_id=uid,
-                    message_id=m.message_id,
-                )
-                ok += 1
-            except Exception:
-                pass
-            await asyncio.sleep(0.05)
-        await m.answer(f"✅ ব্রডকাস্ট সম্পন্ন! ({ok} জন পেয়েছেন)")
-        return
-
-    # ---------- EDIT BALANCE ----------
+    # ---------- 12. EDIT BALANCE ----------
     if state.startswith("a_w_ebal_g_") or state.startswith("a_w_ebal_r_"):
         if state.startswith("a_w_ebal_g_"):
             field = "gmail_wallet"
@@ -2101,66 +2266,141 @@ async def dispatch_admin_input(m: Message):
         tid_int = int(target)
         r = db.user(tid_int)
         if not r:
-            await m.answer("❌ ইউজার নেই।"); return
+            await m.answer("❌ ইউজার নেই।")
+            return
         old = r[field] or 0
         new = max(0, old + amount)
         db.set_wallet(tid_int, field, new)
         await m.answer(
             f"✅ {esc(udisplay(tid_int, r))}-এর {label}: "
             f"`{old:g}` → `{new:g}` টাকা",
-            reply_markup=kb_back("admin", "🔙 অ্যাডমিন"),
-        )
+            reply_markup=kb_back("a_bal_menu", "🔙 ব্যালেন্স"))
         try:
             await bot.send_message(
                 tid_int,
                 f"{'🎉 যোগ' if amount >= 0 else 'ℹ️ কর্তন'} `{abs(amount):g}` টাকা।\n"
-                f"নতুন ব্যালেন্স: `{new:g}` টাকা",
-            )
+                f"নতুন ব্যালেন্স: `{new:g}` টাকা")
         except Exception:
             pass
         return
 
+    # ---------- 13. ADD ADMIN ----------
+    if state == "a_w_addadmin":
+        db.set_state(uid, "")
+        if not text.isdigit():
+            await m.answer("⚠️ সঠিক আইডি দিন।")
+            return
+        target = int(text)
+        if target in ADMIN_IDS or target in db.extra_admins():
+            await m.answer(f"ℹ️ `{target}` ইতিমধ্যে অ্যাডমিন।",
+                           reply_markup=kb_back("admin", "🔙 অ্যাডমিন"))
+            return
+        db.add_admin(target)
+        await m.answer(f"✅ `{target}` অ্যাডমিন হয়েছে।",
+                       reply_markup=kb_back("admin", "🔙 অ্যাডমিন"))
+        try:
+            await bot.send_message(target,
+                "🎉 আপনাকে অ্যাডমিন করা হয়েছে! /start দিন।")
+        except Exception:
+            pass
+        return
 
-# ---------- /backup command ----------
+    # ---------- 14. COMMISSION ----------
+    if state == "a_w_comm":
+        try:
+            val = int(text)
+            if val < 0 or val > 100:
+                raise ValueError
+        except ValueError:
+            await m.answer("⚠️ ০-১০০ এর মধ্যে দিন।")
+            return
+        db.set_state(uid, "")
+        db.set("refer_percent", val)
+        await m.answer(f"✅ কমিশন **{val}%** সেট।",
+                       reply_markup=kb_back("admin", "🔙 অ্যাডমিন"))
+        return
+
+    # ---------- 15. CONTACT ----------
+    if state == "a_w_sup":
+        db.set_state(uid, "")
+        clean = text.lstrip("@").strip()
+        if not clean:
+            await m.answer("⚠️ সঠিক ইউজারনেম দিন।")
+            return
+        db.set("support", clean)
+        await m.answer(f"✅ সাপোর্ট: @{clean}",
+                       reply_markup=kb_back("admin", "🔙 অ্যাডমিন"))
+        return
+
+    if state == "a_w_ch":
+        db.set_state(uid, "")
+        clean = text.lstrip("@").strip()
+        if not clean:
+            await m.answer("⚠️ সঠিক ইউজারনেম দিন।")
+            return
+        db.set("channel", clean)
+        await m.answer(f"✅ চ্যানেল: @{clean}",
+                       reply_markup=kb_back("admin", "🔙 অ্যাডমিন"))
+        return
+
+    # ---------- 16. BROADCAST ----------
+    if state == "a_w_bc":
+        db.set_state(uid, "")
+        await m.answer("📢 ব্রডকাস্ট পাঠানো হচ্ছে...")
+        ok = 0
+        for u in db.all_uids():
+            try:
+                await bot.copy_message(
+                    chat_id=u,
+                    from_chat_id=uid,
+                    message_id=m.message_id)
+                ok += 1
+            except Exception:
+                pass
+            await asyncio.sleep(0.05)
+        await m.answer(f"✅ ব্রডকাস্ট সম্পন্ন! ({ok} জন পেয়েছেন)")
+        return
+
+
+# ==========================================================
+# FALLBACK
+# ==========================================================
+
+@router.callback_query()
+async def cb_fallback(cb: CallbackQuery):
+    await answer(cb, "ℹ️ এই বাটন কাজ করছে না।")
+
+
 @router.message(Command("backup"))
 async def cmd_backup(m: Message):
-    if not db.is_admin(m.from_user.id): return
+    if not db.is_admin(m.from_user.id):
+        return
     try:
         with open(DB_FILE, "rb") as f:
             data = f.read()
         fname = f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
         await m.answer_document(
             BufferedInputFile(data, filename=fname),
-            caption=f"💾 ডাটাবেস ব্যাকআপ — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        )
+            caption=f"💾 ডাটাবেস ব্যাকআপ")
     except Exception as e:
         await m.answer(f"❌ ব্যর্থ: {e}")
 
 
-# ---------- Fallback (শেষে থাকবে) ----------
-@router.callback_query()
-async def cb_fallback(cb: CallbackQuery):
-    await answer(cb, "ℹ️ এই বাটন কাজ করছে না।", alert=False)
-
-
 @router.message(F.text)
 async def msg_fallback(m: Message):
+    if db.is_admin(m.from_user.id) and db.state(m.from_user.id).startswith("a_w_"):
+        return
     db.set_state(m.from_user.id, "")
     await m.answer(
         "ℹ️ বোঝা যায়নি। /start দিয়ে মেইন মেনুতে যান।",
-        reply_markup=kb_back(),
-    )
+        reply_markup=kb_back())
 
 
 # ==========================================================
-# MAIN — Webhook + Health endpoint
-# ==========================================================
-# ==========================================================
-# MAIN — Polling + Health endpoint + Self-ping (২৪/৭ চেষ্টা)
+# MAIN — Polling + Health + Self-ping
 # ==========================================================
 
 async def self_ping_loop():
-    """প্রতি ১০ মিনিটে নিজের /health endpoint-এ ping করে Render-কে জাগিয়ে রাখার চেষ্টা।"""
     url = os.getenv("RENDER_EXTERNAL_URL", "")
     if not url:
         log.warning("RENDER_EXTERNAL_URL নেই — self-ping বন্ধ")
@@ -2183,23 +2423,16 @@ async def health(request):
 
 
 async def run_polling():
-    """Polling mode-এ বট চালায়।"""
     log.info("Starting bot in POLLING mode...")
-    # পুরনো webhook থাকলে মুছে ফেলি
     try:
         await bot.delete_webhook(drop_pending_updates=True)
     except Exception:
         pass
-
-    # Self-ping task চালু
     asyncio.create_task(self_ping_loop())
-
-    # Polling শুরু
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 
 async def run_health_server():
-    """Polling-এর সাথে সাথে একটা ছোট web server চালায় শুধু /health endpoint-এর জন্য।"""
     app = web.Application()
     app.router.add_get("/", health)
     app.router.add_get("/health", health)
@@ -2212,7 +2445,6 @@ async def run_health_server():
 
 async def main_async():
     dp.include_router(router)
-    # health server আর polling দুটো একসাথে চালাই
     await asyncio.gather(
         run_health_server(),
         run_polling(),
